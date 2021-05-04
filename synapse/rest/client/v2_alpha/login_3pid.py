@@ -29,6 +29,7 @@ from synapse.rest.client.v2_alpha._base import client_patterns, interactive_auth
 from synapse.rest.well_known import WellKnownBuilder
 from synapse.types import JsonDict, UserID
 
+from synapse.handlers.ui_auth import UIAuthSessionDataConstants
 from synapse.api.constants import LoginType
 from synapse.util.threepids import canonicalise_email, check_3pid_allowed
 from synapse.util.msisdn import phone_number_to_msisdn
@@ -52,6 +53,12 @@ class EmailLogin3pidRequestTokenRestServlet(RestServlet):
         self.identity_handler = hs.get_identity_handler()
         self.config = hs.config
 
+        self._address_ratelimiter = Ratelimiter(
+            clock=hs.get_clock(),
+            rate_hz=self.hs.config.rc_login_address.per_second,
+            burst_count=self.hs.config.rc_login_address.burst_count,
+        )
+
         if self.hs.config.threepid_behaviour_email == ThreepidBehaviour.LOCAL:
             self.mailer = Mailer(
                 hs=self.hs,
@@ -61,6 +68,7 @@ class EmailLogin3pidRequestTokenRestServlet(RestServlet):
             )
 
     async def on_POST(self, request):
+        self._address_ratelimiter.ratelimit(request.getClientIP())
         if self.hs.config.threepid_behaviour_email == ThreepidBehaviour.OFF:
             if self.hs.config.local_threepid_handling_disabled_due_to_email_config:
                 logger.warning(
@@ -152,7 +160,15 @@ class MsisdnLogin3pidRequestTokenRestServlet(RestServlet):
         self.hs = hs
         self.identity_handler = hs.get_identity_handler()
 
+        self._address_ratelimiter = Ratelimiter(
+            clock=hs.get_clock(),
+            rate_hz=self.hs.config.rc_login_address.per_second,
+            burst_count=self.hs.config.rc_login_address.burst_count,
+        )
+
     async def on_POST(self, request):
+        self._address_ratelimiter.ratelimit(request.getClientIP())
+
         body = parse_json_object_from_request(request)
 
         assert_params_in_dict(
@@ -251,22 +267,46 @@ class Login3pidRestServlet(RestServlet):
     async def on_POST(self, request: SynapseRequest):
         login_submission = parse_json_object_from_request(request)
 
+        if "type" not in login_submission:
+            self._address_ratelimiter.ratelimit(request.getClientIP(), update=False)
+            flows = []
+
+            flows.append({"type": LoginType.MSISDN})
+            flows.append({"type": LoginType.EMAIL_IDENTITY})
+
+            session_id = self.auth_handler.get_session_id(login_submission)
+            logged_user_id = None
+            if session_id:
+                logged_user_id = await self.auth_handler.get_session_data(
+                    session_id, UIAuthSessionDataConstants.REQUEST_USER_ID, None
+                )
+                if logged_user_id is not None:
+                    raise SynapseError(403, "Already logged for this session")
+
+            auth_result, params, session_id = await self.auth_handler.check_ui_auth(
+                [[LoginType.MSISDN], [LoginType.EMAIL_IDENTITY]], request, login_submission, "login into account",
+            )
+
+            raise SynapseError(400, "Missing JSON keys.")
+
         try:
-            if login_submission["type"] is None:
-                raise SynapseError(400, "Missing JSON keys.")
-            elif login_submission["type"] == LoginType.MSISDN or login_submission["type"] == LoginType.EMAIL_IDENTITY:
-                self._address_ratelimiter.ratelimit(request.getClientIP())
+            if login_submission["type"] == LoginType.MSISDN or login_submission["type"] == LoginType.EMAIL_IDENTITY:
+                self._address_ratelimiter.ratelimit(request.getClientIP(), update=False)
+                session_id = self.auth_handler.get_session_id(login_submission)
+                logged_user_id = None
+                if session_id:
+                    logged_user_id = await self.auth_handler.get_session_data(
+                        session_id, UIAuthSessionDataConstants.REQUEST_USER_ID, None
+                    )
+                    if logged_user_id is not None:
+                        raise SynapseError(403, "Already logged for this session")
+
                 login_type = login_submission["type"]
                 flows = [[login_type]]
                 auth_result, params, session_id = await self.auth_handler.check_ui_auth(
                     flows, request, login_submission, "login into account",
                 )
                 # Check that we're not trying to login a denied 3pid.
-                #
-                # the user-facing checks will probably already have happened in
-                # /register/login/requestToken when we requested a 3pid, but that's not
-                # guaranteed.
-                existing_user_id = None
                 if auth_result:
                     if login_type in auth_result:
                         medium = auth_result[login_type]["medium"]
@@ -290,17 +330,23 @@ class Login3pidRestServlet(RestServlet):
                             except ValueError as e:
                                 raise SynapseError(400, str(e))
 
-                        existing_user_id = await self.store.get_user_id_by_threepid(
+                        logged_user_id = await self.store.get_user_id_by_threepid(
                             medium, address
                         )
-                if existing_user_id is None:
+                if logged_user_id is None:
                     raise SynapseError(
-                                400,
-                                "User not exists",
-                                Codes.THREEPID_IN_USE,
-                            )
+                        400,
+                        "User not exists",
+                        Codes.THREEPID_IN_USE,
+                    )
                 result = await self._complete_login(
-                    existing_user_id, login_submission,
+                    logged_user_id, login_submission,
+                )
+
+                await self.auth_handler.set_session_data(
+                    session_id,
+                    UIAuthSessionDataConstants.REQUEST_USER_ID,
+                    logged_user_id,
                 )
             else:
                 raise SynapseError(400, "Only msisdn and email allowed")
