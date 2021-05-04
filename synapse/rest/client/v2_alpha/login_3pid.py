@@ -54,6 +54,7 @@ class EmailLogin3pidRequestTokenRestServlet(RestServlet):
         self.config = hs.config
 
         self._address_ratelimiter = Ratelimiter(
+            store=hs.get_datastore(),
             clock=hs.get_clock(),
             rate_hz=self.hs.config.rc_login_address.per_second,
             burst_count=self.hs.config.rc_login_address.burst_count,
@@ -68,7 +69,7 @@ class EmailLogin3pidRequestTokenRestServlet(RestServlet):
             )
 
     async def on_POST(self, request):
-        self._address_ratelimiter.ratelimit(request.getClientIP())
+        self._address_ratelimiter.ratelimit(None, request.getClientIP())
         if self.hs.config.threepid_behaviour_email == ThreepidBehaviour.OFF:
             if self.hs.config.local_threepid_handling_disabled_due_to_email_config:
                 logger.warning(
@@ -161,13 +162,14 @@ class MsisdnLogin3pidRequestTokenRestServlet(RestServlet):
         self.identity_handler = hs.get_identity_handler()
 
         self._address_ratelimiter = Ratelimiter(
+            store=hs.get_datastore(),
             clock=hs.get_clock(),
             rate_hz=self.hs.config.rc_login_address.per_second,
             burst_count=self.hs.config.rc_login_address.burst_count,
         )
 
     async def on_POST(self, request):
-        self._address_ratelimiter.ratelimit(request.getClientIP())
+        self._address_ratelimiter.ratelimit(None, request.getClientIP())
 
         body = parse_json_object_from_request(request)
 
@@ -245,11 +247,13 @@ class Login3pidRestServlet(RestServlet):
 
         self._well_known_builder = WellKnownBuilder(hs)
         self._address_ratelimiter = Ratelimiter(
+            store=hs.get_datastore(),
             clock=hs.get_clock(),
             rate_hz=self.hs.config.rc_login_address.per_second,
             burst_count=self.hs.config.rc_login_address.burst_count,
         )
         self._account_ratelimiter = Ratelimiter(
+            store=hs.get_datastore(),
             clock=hs.get_clock(),
             rate_hz=self.hs.config.rc_login_account.per_second,
             burst_count=self.hs.config.rc_login_account.burst_count,
@@ -268,7 +272,7 @@ class Login3pidRestServlet(RestServlet):
         login_submission = parse_json_object_from_request(request)
 
         if "type" not in login_submission:
-            self._address_ratelimiter.ratelimit(request.getClientIP(), update=False)
+            self._address_ratelimiter.ratelimit(None, request.getClientIP(), update=False)
             flows = []
 
             flows.append({"type": LoginType.MSISDN})
@@ -291,7 +295,7 @@ class Login3pidRestServlet(RestServlet):
 
         try:
             if login_submission["type"] == LoginType.MSISDN or login_submission["type"] == LoginType.EMAIL_IDENTITY:
-                self._address_ratelimiter.ratelimit(request.getClientIP(), update=False)
+                self._address_ratelimiter.ratelimit(None, request.getClientIP(), update=False)
                 session_id = self.auth_handler.get_session_id(login_submission)
                 logged_user_id = None
                 if session_id:
@@ -389,7 +393,7 @@ class Login3pidRestServlet(RestServlet):
         # too often. This happens here rather than before as we don't
         # necessarily know the user before now.
         if ratelimit:
-            self._account_ratelimiter.ratelimit(user_id.lower())
+            self._account_ratelimiter.ratelimit(None, user_id.lower())
 
         if create_non_existent_users:
             canonical_uid = await self.auth_handler.check_user_exists(user_id)
