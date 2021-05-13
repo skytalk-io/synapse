@@ -1,0 +1,35 @@
+image:
+  repository: ciliconherve/synapse
+  tag: latest
+  pullSecrets: []
+#  - cilicon-dockerhub
+
+serverName: k8ssub1.skytalk.io
+# publicServerName: matrix.k8ssub1.skytalk.io
+
+
+config:
+  enableRegistration: true
+  enable3pidLookup: true
+  accountThreepidDelegates:
+    email: https://signal.skytalk.io     # Delegate email sending to example.com
+    msisdn: https://signal.skytalk.io  # Delegate SMS sending to this local process
+
+ingress:
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    cert-manager.io/cluster-issuer: "letsencrypt"
+    certmanager.k8s.io/cluster-issuer: "letsencrypt"
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      rewrite /_matrix/media/r0/download/sub.skytalk.io/(.*)$ /_matrix/media/$1 break;
+  hosts:
+  - k8ssub1.skytalk.io
+  tls:
+  - secretName: matrix-tls
+    hosts:
+    - k8ssub1.skytalk.io
+
+wellknown:
+  enabled: true
+

@@ -46,3 +46,7 @@ __pycache__/
 /docs/build/
 /htmlcov
 /pip-wheel-metadata/
+
+# Helm resources
+Chart.lock
+*.tgz

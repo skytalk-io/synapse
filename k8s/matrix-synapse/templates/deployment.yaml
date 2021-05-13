@@ -1,0 +1,186 @@
+{{- $needsVolumePermissions := and .Values.volumePermissions.enabled (or .Values.persistence.enabled .Values.persistence.existingClaim) }}
+{{- if (and .Values.postgresql.enabled (not .Values.postgresql.postgresqlPassword)) -}}
+{{-  fail "You must specify a static postgres password if using the included postgres chart" -}}
+{{- end -}}
+{{- if (and .Values.redis.enabled (and .Values.redis.usePassword (not .Values.redis.password))) -}}
+{{-  fail "You must specify a static redis password if using the included redis chart" -}}
+{{- end -}}
+---
+# Server: {{ required "A valid serverName is required" .Values.serverName }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "matrix-synapse.fullname" . }}
+  labels:
+    {{- include "matrix-synapse.labels" . | nindent 4 }}
+    app.kubernetes.io/component: synapse
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "matrix-synapse.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: synapse
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configuration.yaml") . | sha256sum }}
+        checksum/secrets: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum }}
+        {{- with .Values.synapse.annotations }}
+        {{ . | toYaml | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "matrix-synapse.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: synapse
+        {{- with .Values.synapse.labels }}
+        {{ . | toYaml | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- include "matrix-synapse.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- toYaml .Values.synapse.podSecurityContext | nindent 8 }}
+    {{- if $needsVolumePermissions }}
+      initContainers:
+        - name: volume-permissions
+          command:
+            - sh
+            - -c
+            - |
+              chown {{ .Values.volumePermissions.uid }}:{{ .Values.volumePermissions.gid }} -R /synapse/data
+          image: "{{ .Values.volumePermissions.image.repository }}:{{ .Values.volumePermissions.image.tag }}"
+          resources:
+            {{- toYaml .Values.volumePermissions.resources | nindent 12 }}
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+          volumeMounts:
+            - name: media
+              mountPath: /synapse/data
+    {{- end }}
+      containers:
+        - name: synapse
+          command:
+            - sh
+            - -c
+            - |
+              cat /synapse/secrets/*.yaml | \
+                sed -e "s/@@POSTGRES_PASSWORD@@/${POSTGRES_PASSWORD:-}/" \
+                    -e "s/@@REDIS_PASSWORD@@/${REDIS_PASSWORD:-}/" \
+                       > /synapse/config/conf.d/secrets.yaml
+
+              {{- if .Values.synapse.extraCommands }}
+
+              {{ range .Values.synapse.extraCommands }}
+              {{ . }}
+              {{- end }}
+              {{- end }}
+
+              exec python -B -m synapse.app.homeserver \
+                          -c /synapse/config/homeserver.yaml \
+                          -c /synapse/config/conf.d/
+          env:
+{{- $postgresPass := include "matrix-synapse.postgresql.password" . }}
+          {{- if and .Values.postgresql.enabled (not $postgresPass) }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "matrix-synapse.postgresql.fullname" . }}
+                  key: postgresql-password
+          {{- end }}
+{{- $redisPass := include "matrix-synapse.redis.password" . }}
+          {{- if and .Values.redis.enabled (default .Values.redis.usePassword true) (not $redisPass) }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "matrix-synapse.redis.fullname" . }}
+                  key: redis-password
+          {{- end }}
+          {{- with .Values.synapse.extraEnv }}
+            {{ . | toYaml }}
+          {{- end }}
+          image: "{{ .Values.image.repository }}:{{ include "matrix-synapse.imageTag" . }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.synapse.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8008
+              protocol: TCP
+            - name: replication
+              containerPort: 9093
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+          volumeMounts:
+            - name: config
+              mountPath: /synapse/config
+            - name: scripts
+              mountPath: /opt/k8s-synapse
+            - name: tmpconf
+              mountPath: /synapse/config/conf.d
+            - name: secrets
+              mountPath: /synapse/secrets
+            - name: signingkey
+              mountPath: /synapse/keys
+            - name: media
+              mountPath: /synapse/data
+          {{- with .Values.synapse.extraVolumeMounts }}
+            {{- . | toYaml | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.synapse.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "matrix-synapse.fullname" . }}
+        - name: scripts
+          configMap:
+            name: {{ include "matrix-synapse.fullname" . }}-scripts
+            defaultMode: 0755
+        - name: secrets
+          secret:
+            secretName: {{ include "matrix-synapse.fullname" . }}
+        - name: signingkey
+          secret:
+            secretName: {{ .Values.signingkey.existingSecret | default (include "matrix-synapse.workername" (dict "global" . "worker" "signingkey")) | quote }}
+            items:
+              - key: {{ .Values.signingkey.existingSecretKey | default "signing.key" | quote }}
+                path: signing.key
+        - name: tmpconf
+          emptyDir: {}
+        - name: media
+        {{- $mediaworker := false }}
+        {{- range $worker, $config := .Values.workers }}
+          {{- if eq $worker "media-repository" }}
+            {{- $mediaworker = true }}
+          {{- end }}
+        {{- end }}
+        {{- if and .Values.persistence.enabled (not $mediaworker) }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim | default (include "matrix-synapse.fullname" .) }}
+        {{- else }}
+          emptyDir: {}
+        {{- end }}
+        {{- with .Values.synapse.extraVolumes }}
+          {{- . | toYaml | nindent 8 }}
+        {{- end }}
+      {{- with .Values.synapse.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- with .Values.synapse.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+    {{- with .Values.synapse.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
