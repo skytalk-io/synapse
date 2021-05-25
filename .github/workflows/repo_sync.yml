@@ -2,7 +2,7 @@ name: Sync with Upstream
 
 on:
   schedule: 
-  - cron: "*/35 * * * *"
+  - cron: "40 * * * *"
 
 jobs:
   develop:
@@ -25,3 +25,4 @@ jobs:
         github_token: ${{ secrets.GITHUB_TOKEN }}
         pr_title: "Pulling ${{ github.ref }} into develop"
         pr_body: ":crown: *An automated PR to sync with upstream*"
+        pr_reviewer: "cmpayc"
