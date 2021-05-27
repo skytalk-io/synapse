@@ -40,8 +40,11 @@ from synapse.config.emailconfig import ThreepidBehaviour
 
 logger = logging.getLogger(__name__)
 
+
 class EmailLogin3pidRequestTokenRestServlet(RestServlet):
-    PATTERNS = client_patterns("/login_3pid/email/requestToken$", releases=(), unstable=True)
+    PATTERNS = client_patterns(
+        "/login_3pid/email/requestToken$", releases=(), unstable=True
+    )
 
     def __init__(self, hs):
         """
@@ -149,8 +152,11 @@ class EmailLogin3pidRequestTokenRestServlet(RestServlet):
 
         return 200, ret
 
+
 class MsisdnLogin3pidRequestTokenRestServlet(RestServlet):
-    PATTERNS = client_patterns("/login_3pid/msisdn/requestToken$", releases=(), unstable=True)
+    PATTERNS = client_patterns(
+        "/login_3pid/msisdn/requestToken$", releases=(), unstable=True
+    )
 
     def __init__(self, hs):
         """
@@ -204,9 +210,7 @@ class MsisdnLogin3pidRequestTokenRestServlet(RestServlet):
                 await self.hs.get_clock().sleep(random.randint(1, 10) / 10)
                 return 200, {"sid": random_string(16)}
 
-            raise SynapseError(
-                400, "User not found", Codes.THREEPID_IN_USE
-            )
+            raise SynapseError(400, "User not found", Codes.THREEPID_IN_USE)
 
         if not self.hs.config.account_threepid_delegate_msisdn:
             logger.warning(
@@ -272,7 +276,9 @@ class Login3pidRestServlet(RestServlet):
         login_submission = parse_json_object_from_request(request)
 
         if "type" not in login_submission:
-            self._address_ratelimiter.ratelimit(None, request.getClientIP(), update=False)
+            self._address_ratelimiter.ratelimit(
+                None, request.getClientIP(), update=False
+            )
             flows = []
 
             flows.append({"type": LoginType.MSISDN})
@@ -288,14 +294,22 @@ class Login3pidRestServlet(RestServlet):
                     raise SynapseError(403, "Already logged for this session")
 
             auth_result, params, session_id = await self.auth_handler.check_ui_auth(
-                [[LoginType.MSISDN], [LoginType.EMAIL_IDENTITY]], request, login_submission, "login into account",
+                [[LoginType.MSISDN], [LoginType.EMAIL_IDENTITY]],
+                request,
+                login_submission,
+                "login into account",
             )
 
             raise SynapseError(400, "Missing JSON keys.")
 
         try:
-            if login_submission["type"] == LoginType.MSISDN or login_submission["type"] == LoginType.EMAIL_IDENTITY:
-                self._address_ratelimiter.ratelimit(None, request.getClientIP(), update=False)
+            if (
+                login_submission["type"] == LoginType.MSISDN
+                or login_submission["type"] == LoginType.EMAIL_IDENTITY
+            ):
+                self._address_ratelimiter.ratelimit(
+                    None, request.getClientIP(), update=False
+                )
                 session_id = self.auth_handler.get_session_id(login_submission)
                 logged_user_id = None
                 if session_id:
@@ -308,7 +322,10 @@ class Login3pidRestServlet(RestServlet):
                 login_type = login_submission["type"]
                 flows = [[login_type]]
                 auth_result, params, session_id = await self.auth_handler.check_ui_auth(
-                    flows, request, login_submission, "login into account",
+                    flows,
+                    request,
+                    login_submission,
+                    "login into account",
                 )
                 # Check that we're not trying to login a denied 3pid.
                 if auth_result:
@@ -323,7 +340,7 @@ class Login3pidRestServlet(RestServlet):
                                 + " are not authorized on this server",
                                 Codes.THREEPID_DENIED,
                             )
-                        
+
                         # For emails, canonicalise the address.
                         # We store all email addresses canonicalised in the DB.
                         # (See on_POST in EmailThreepidRequestTokenRestServlet
@@ -344,7 +361,8 @@ class Login3pidRestServlet(RestServlet):
                         Codes.THREEPID_IN_USE,
                     )
                 result = await self._complete_login(
-                    logged_user_id, login_submission,
+                    logged_user_id,
+                    login_submission,
                 )
 
                 await self.auth_handler.set_session_data(
@@ -420,6 +438,7 @@ class Login3pidRestServlet(RestServlet):
             await callback(result)
 
         return result
+
 
 def register_servlets(hs, http_server):
     Login3pidRestServlet(hs).register(http_server)
