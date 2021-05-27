@@ -15,14 +15,13 @@
 
 import logging
 import random
-from typing import TYPE_CHECKING, Awaitable, Callable, Dict, Optional
+from typing import Awaitable, Callable, Dict, Optional
 
 from synapse.api.constants import LoginType
 from synapse.api.errors import Codes, SynapseError
 from synapse.api.ratelimiting import Ratelimiter
 from synapse.config.emailconfig import ThreepidBehaviour
 from synapse.handlers.ui_auth import UIAuthSessionDataConstants
-from synapse.http.server import HttpServer
 from synapse.http.servlet import (
     RestServlet,
     assert_params_in_dict,
