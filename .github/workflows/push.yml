@@ -1,4 +1,4 @@
-name: Main
+name: Push
 on:
   # push:
   pull_request:
@@ -46,7 +46,8 @@ jobs:
         context: .
         file: docker/Dockerfile
         platforms: linux/amd64,linux/arm64
-        push: true
+        # push: true
+        push: false
         tags: |
           ${{ env.DOCKER_IMAGE_NAME }}:${{ steps.generate_tag.outputs.new_tag }}
 
