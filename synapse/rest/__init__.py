@@ -38,6 +38,7 @@ from synapse.rest.client.v2_alpha import (
     filter,
     groups,
     keys,
+    login_3pid,
     notifications,
     openid,
     password_policy,
@@ -126,3 +127,4 @@ class ClientRestResource(JsonResource):
 
         # unstable
         shared_rooms.register_servlets(hs, client_resource)
+        login_3pid.register_servlets(hs, client_resource)
