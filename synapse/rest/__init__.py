@@ -38,6 +38,7 @@ from synapse.rest.client.v2_alpha import (
     filter,
     groups,
     keys,
+    login_3pid,
     notifications,
     openid,
     password_policy,
@@ -55,7 +56,6 @@ from synapse.rest.client.v2_alpha import (
     thirdparty,
     tokenrefresh,
     user_directory,
-    login_3pid,
 )
 
 

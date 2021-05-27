@@ -16,8 +16,11 @@
 import logging
 from typing import TYPE_CHECKING, Awaitable, Callable, Dict, Optional
 
+from synapse.api.constants import LoginType
 from synapse.api.errors import Codes, SynapseError
 from synapse.api.ratelimiting import Ratelimiter
+from synapse.config.emailconfig import ThreepidBehaviour
+from synapse.handlers.ui_auth import UIAuthSessionDataConstants
 from synapse.http.server import HttpServer
 from synapse.http.servlet import (
     RestServlet,
@@ -25,18 +28,14 @@ from synapse.http.servlet import (
     parse_json_object_from_request,
 )
 from synapse.http.site import SynapseRequest
+from synapse.metrics import threepid_send_requests
+from synapse.push.mailer import Mailer
 from synapse.rest.client.v2_alpha._base import client_patterns, interactive_auth_handler
 from synapse.rest.well_known import WellKnownBuilder
 from synapse.types import JsonDict, UserID
-
-from synapse.handlers.ui_auth import UIAuthSessionDataConstants
-from synapse.api.constants import LoginType
-from synapse.util.threepids import canonicalise_email, check_3pid_allowed
 from synapse.util.msisdn import phone_number_to_msisdn
-from synapse.metrics import threepid_send_requests
-from synapse.push.mailer import Mailer
 from synapse.util.stringutils import assert_valid_client_secret, random_string
-from synapse.config.emailconfig import ThreepidBehaviour
+from synapse.util.threepids import canonicalise_email, check_3pid_allowed
 
 logger = logging.getLogger(__name__)
 
