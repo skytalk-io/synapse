@@ -23,7 +23,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         WITH_V: true
         DEFAULT_BUMP: patch
-        RELEASE_BRANCHES: master
+        RELEASE_BRANCHES: develop
         DRY_RUN: true
 
     - name: Set up QEMU
@@ -56,5 +56,5 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         WITH_V: true
         DEFAULT_BUMP: patch
-        RELEASE_BRANCHES: master
+        RELEASE_BRANCHES: develop
         DRY_RUN: true
