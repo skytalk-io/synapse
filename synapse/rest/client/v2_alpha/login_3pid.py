@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+import random
 from typing import TYPE_CHECKING, Awaitable, Callable, Dict, Optional
 
 from synapse.api.constants import LoginType
@@ -272,10 +273,6 @@ class Login3pidRestServlet(RestServlet):
 
         if "type" not in login_submission:
             self._address_ratelimiter.ratelimit(None, request.getClientIP(), update=False)
-            flows = []
-
-            flows.append({"type": LoginType.MSISDN})
-            flows.append({"type": LoginType.EMAIL_IDENTITY})
 
             session_id = self.auth_handler.get_session_id(login_submission)
             logged_user_id = None
@@ -305,9 +302,8 @@ class Login3pidRestServlet(RestServlet):
                         raise SynapseError(403, "Already logged for this session")
 
                 login_type = login_submission["type"]
-                flows = [[login_type]]
                 auth_result, params, session_id = await self.auth_handler.check_ui_auth(
-                    flows, request, login_submission, "login into account",
+                    [[login_type]], request, login_submission, "login into account",
                 )
                 # Check that we're not trying to login a denied 3pid.
                 if auth_result:
