@@ -54,7 +54,10 @@ COPY synapse /synapse/synapse/
 #
 # This is aiming at installing only the `packages=find_packages(...)` from `setup.py
 RUN pip install --prefix="/install" --no-deps --no-warn-script-location /synapse
-
+# Install dependencies for synapse-s3-storage-provider module
+#
+# https://github.com/matrix-org/synapse-s3-storage-provider/
+RUN pip install boto3
 ###
 ### Stage 1: runtime
 ###
