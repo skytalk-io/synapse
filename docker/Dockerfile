@@ -44,7 +44,7 @@ COPY synapse/python_dependencies.py /synapse/synapse/python_dependencies.py
 # used while you develop on the source
 #
 # This is aiming at installing the `install_requires` and `extras_require` from `setup.py`
-RUN pip install --prefix="/install" --no-warn-script-location \
+    RUN pip install --prefix="/install" --no-warn-script-location \
     /synapse[all]
 
 # Copy over the rest of the project
@@ -57,7 +57,7 @@ RUN pip install --prefix="/install" --no-deps --no-warn-script-location /synapse
 # Install dependencies for synapse-s3-storage-provider module
 #
 # https://github.com/matrix-org/synapse-s3-storage-provider/
-RUN pip install boto3
+RUN pip install --prefix="/install" --no-warn-script-location boto3
 ###
 ### Stage 1: runtime
 ###
