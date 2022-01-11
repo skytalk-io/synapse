@@ -3,6 +3,7 @@ name: Build
 on:
   pull_request:
     branches: ["develop"]
+  workflow_dispatch:
 
 env:
   DOCKER_IMAGE_NAME: docker.io/ciliconherve/synapse
