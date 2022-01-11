@@ -32,19 +32,6 @@ jobs:
       - name: Check line endings
         run: scripts-dev/check_line_terminators.sh
 
-  lint-newsfile:
-    if: ${{ github.base_ref == 'develop'  || contains(github.base_ref, 'release-') }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
-      - run: pip install tox
-      - name: Patch Buildkite-specific test script
-        run: |
-          sed -i -e 's/\$BUILDKITE_PULL_REQUEST/${{ github.event.number }}/' \
-            scripts-dev/check-newsfragment
-      - run: scripts-dev/check-newsfragment
-
   lint-sdist:
     runs-on: ubuntu-latest
     steps:
@@ -62,7 +49,7 @@ jobs:
   # Dummy step to gate other tests on without repeating the whole list
   linting-done:
     if: ${{ always() }} # Run this even if prior jobs were skipped
-    needs: [lint, lint-crlf, lint-newsfile, lint-sdist]
+    needs: [lint, lint-crlf, lint-sdist]
     runs-on: ubuntu-latest
     steps:
       - run: "true"

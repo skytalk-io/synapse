@@ -14,6 +14,8 @@
 
 from unittest.mock import Mock
 
+from synapse.storage.databases.main.event_push_actions import NotifCounts
+
 from tests.unittest import HomeserverTestCase
 
 USER_ID = "@user:example.com"
@@ -57,11 +59,11 @@ class EventPushActionsStoreTestCase(HomeserverTestCase):
             )
             self.assertEquals(
                 counts,
-                {
-                    "notify_count": noitf_count,
-                    "unread_count": 0,  # Unread counts are tested in the sync tests.
-                    "highlight_count": highlight_count,
-                },
+                NotifCounts(
+                    notify_count=noitf_count,
+                    unread_count=0,  # Unread counts are tested in the sync tests.
+                    highlight_count=highlight_count,
+                ),
             )
 
         def _inject_actions(stream, action):
@@ -69,6 +71,7 @@ class EventPushActionsStoreTestCase(HomeserverTestCase):
             event.room_id = room_id
             event.event_id = "$test:example.com"
             event.internal_metadata.stream_ordering = stream
+            event.internal_metadata.is_outlier.return_value = False
             event.depth = stream
 
             self.get_success(

@@ -21,16 +21,17 @@ from synapse.api.constants import UserTypes
 from synapse.api.errors import (
     AuthError,
     Codes,
-    InvalidClientCredentialsError,
     InvalidClientTokenError,
     MissingClientTokenError,
     ResourceLimitError,
 )
+from synapse.appservice import ApplicationService
 from synapse.storage.databases.main.registration import TokenLookupResult
-from synapse.types import UserID
+from synapse.types import Requester
 
 from tests import unittest
 from tests.test_utils import simple_async_mock
+from tests.unittest import override_config
 from tests.utils import mock_getRawHeaders
 
 
@@ -60,6 +61,7 @@ class AuthTestCase(unittest.HomeserverTestCase):
             user_id=self.test_user, token_id=5, device_id="device"
         )
         self.store.get_user_by_access_token = simple_async_mock(user_info)
+        self.store.mark_access_token_as_used = simple_async_mock(None)
 
         request = Mock(args={})
         request.args[b"access_token"] = [self.test_token]
@@ -209,6 +211,69 @@ class AuthTestCase(unittest.HomeserverTestCase):
         request.requestHeaders.getRawHeaders = mock_getRawHeaders()
         self.get_failure(self.auth.get_user_by_req(request), AuthError)
 
+    @override_config({"experimental_features": {"msc3202_device_masquerading": True}})
+    def test_get_user_by_req_appservice_valid_token_valid_device_id(self):
+        """
+        Tests that when an application service passes the device_id URL parameter
+        with the ID of a valid device for the user in question,
+        the requester instance tracks that device ID.
+        """
+        masquerading_user_id = b"@doppelganger:matrix.org"
+        masquerading_device_id = b"DOPPELDEVICE"
+        app_service = Mock(
+            token="foobar", url="a_url", sender=self.test_user, ip_range_whitelist=None
+        )
+        app_service.is_interested_in_user = Mock(return_value=True)
+        self.store.get_app_service_by_token = Mock(return_value=app_service)
+        # This just needs to return a truth-y value.
+        self.store.get_user_by_id = simple_async_mock({"is_guest": False})
+        self.store.get_user_by_access_token = simple_async_mock(None)
+        # This also needs to just return a truth-y value
+        self.store.get_device = simple_async_mock({"hidden": False})
+
+        request = Mock(args={})
+        request.getClientIP.return_value = "127.0.0.1"
+        request.args[b"access_token"] = [self.test_token]
+        request.args[b"user_id"] = [masquerading_user_id]
+        request.args[b"org.matrix.msc3202.device_id"] = [masquerading_device_id]
+        request.requestHeaders.getRawHeaders = mock_getRawHeaders()
+        requester = self.get_success(self.auth.get_user_by_req(request))
+        self.assertEquals(
+            requester.user.to_string(), masquerading_user_id.decode("utf8")
+        )
+        self.assertEquals(requester.device_id, masquerading_device_id.decode("utf8"))
+
+    @override_config({"experimental_features": {"msc3202_device_masquerading": True}})
+    def test_get_user_by_req_appservice_valid_token_invalid_device_id(self):
+        """
+        Tests that when an application service passes the device_id URL parameter
+        with an ID that is not a valid device ID for the user in question,
+        the request fails with the appropriate error code.
+        """
+        masquerading_user_id = b"@doppelganger:matrix.org"
+        masquerading_device_id = b"NOT_A_REAL_DEVICE_ID"
+        app_service = Mock(
+            token="foobar", url="a_url", sender=self.test_user, ip_range_whitelist=None
+        )
+        app_service.is_interested_in_user = Mock(return_value=True)
+        self.store.get_app_service_by_token = Mock(return_value=app_service)
+        # This just needs to return a truth-y value.
+        self.store.get_user_by_id = simple_async_mock({"is_guest": False})
+        self.store.get_user_by_access_token = simple_async_mock(None)
+        # This also needs to just return a falsey value
+        self.store.get_device = simple_async_mock(None)
+
+        request = Mock(args={})
+        request.getClientIP.return_value = "127.0.0.1"
+        request.args[b"access_token"] = [self.test_token]
+        request.args[b"user_id"] = [masquerading_user_id]
+        request.args[b"org.matrix.msc3202.device_id"] = [masquerading_device_id]
+        request.requestHeaders.getRawHeaders = mock_getRawHeaders()
+
+        failure = self.get_failure(self.auth.get_user_by_req(request), AuthError)
+        self.assertEquals(failure.value.code, 400)
+        self.assertEquals(failure.value.errcode, Codes.EXCLUSIVE)
+
     def test_get_user_from_macaroon(self):
         self.store.get_user_by_access_token = simple_async_mock(
             TokenLookupResult(user_id="@baldrick:matrix.org", device_id="device")
@@ -216,9 +281,9 @@ class AuthTestCase(unittest.HomeserverTestCase):
 
         user_id = "@baldrick:matrix.org"
         macaroon = pymacaroons.Macaroon(
-            location=self.hs.config.server_name,
+            location=self.hs.config.server.server_name,
             identifier="key",
-            key=self.hs.config.macaroon_secret_key,
+            key=self.hs.config.key.macaroon_secret_key,
         )
         macaroon.add_first_party_caveat("gen = 1")
         macaroon.add_first_party_caveat("type = access")
@@ -238,9 +303,9 @@ class AuthTestCase(unittest.HomeserverTestCase):
 
         user_id = "@baldrick:matrix.org"
         macaroon = pymacaroons.Macaroon(
-            location=self.hs.config.server_name,
+            location=self.hs.config.server.server_name,
             identifier="key",
-            key=self.hs.config.macaroon_secret_key,
+            key=self.hs.config.key.macaroon_secret_key,
         )
         macaroon.add_first_party_caveat("gen = 1")
         macaroon.add_first_party_caveat("type = access")
@@ -252,67 +317,6 @@ class AuthTestCase(unittest.HomeserverTestCase):
         self.assertEqual(user_id, user_info.user_id)
         self.assertTrue(user_info.is_guest)
         self.store.get_user_by_id.assert_called_with(user_id)
-
-    def test_cannot_use_regular_token_as_guest(self):
-        USER_ID = "@percy:matrix.org"
-        self.store.add_access_token_to_user = simple_async_mock(None)
-        self.store.get_device = simple_async_mock(None)
-
-        token = self.get_success(
-            self.hs.get_auth_handler().get_access_token_for_user_id(
-                USER_ID, "DEVICE", valid_until_ms=None
-            )
-        )
-        self.store.add_access_token_to_user.assert_called_with(
-            user_id=USER_ID,
-            token=token,
-            device_id="DEVICE",
-            valid_until_ms=None,
-            puppets_user_id=None,
-        )
-
-        async def get_user(tok):
-            if token != tok:
-                return None
-            return TokenLookupResult(
-                user_id=USER_ID,
-                is_guest=False,
-                token_id=1234,
-                device_id="DEVICE",
-            )
-
-        self.store.get_user_by_access_token = get_user
-        self.store.get_user_by_id = simple_async_mock({"is_guest": False})
-
-        # check the token works
-        request = Mock(args={})
-        request.args[b"access_token"] = [token.encode("ascii")]
-        request.requestHeaders.getRawHeaders = mock_getRawHeaders()
-        requester = self.get_success(
-            self.auth.get_user_by_req(request, allow_guest=True)
-        )
-        self.assertEqual(UserID.from_string(USER_ID), requester.user)
-        self.assertFalse(requester.is_guest)
-
-        # add an is_guest caveat
-        mac = pymacaroons.Macaroon.deserialize(token)
-        mac.add_first_party_caveat("guest = true")
-        guest_tok = mac.serialize()
-
-        # the token should *not* work now
-        request = Mock(args={})
-        request.args[b"access_token"] = [guest_tok.encode("ascii")]
-        request.requestHeaders.getRawHeaders = mock_getRawHeaders()
-
-        cm = self.get_failure(
-            self.auth.get_user_by_req(request, allow_guest=True),
-            InvalidClientCredentialsError,
-        )
-
-        self.assertEqual(401, cm.value.code)
-        self.assertEqual("Guest access token used for regular user", cm.value.msg)
-
-        self.store.get_user_by_id.assert_called_with(USER_ID)
 
     def test_blocking_mau(self):
         self.auth_blocking._limit_usage_by_mau = False
@@ -328,7 +332,7 @@ class AuthTestCase(unittest.HomeserverTestCase):
         self.store.get_monthly_active_count = simple_async_mock(lots_of_users)
 
         e = self.get_failure(self.auth.check_auth_blocking(), ResourceLimitError)
-        self.assertEquals(e.value.admin_contact, self.hs.config.admin_contact)
+        self.assertEquals(e.value.admin_contact, self.hs.config.server.admin_contact)
         self.assertEquals(e.value.errcode, Codes.RESOURCE_LIMIT_EXCEEDED)
         self.assertEquals(e.value.code, 403)
 
@@ -352,6 +356,66 @@ class AuthTestCase(unittest.HomeserverTestCase):
         # Real users not allowed
         self.get_failure(self.auth.check_auth_blocking(), ResourceLimitError)
 
+    def test_blocking_mau__appservice_requester_allowed_when_not_tracking_ips(self):
+        self.auth_blocking._max_mau_value = 50
+        self.auth_blocking._limit_usage_by_mau = True
+        self.auth_blocking._track_appservice_user_ips = False
+
+        self.store.get_monthly_active_count = simple_async_mock(100)
+        self.store.user_last_seen_monthly_active = simple_async_mock()
+        self.store.is_trial_user = simple_async_mock()
+
+        appservice = ApplicationService(
+            "abcd",
+            self.hs.config.server.server_name,
+            id="1234",
+            namespaces={
+                "users": [{"regex": "@_appservice.*:sender", "exclusive": True}]
+            },
+            sender="@appservice:sender",
+        )
+        requester = Requester(
+            user="@appservice:server",
+            access_token_id=None,
+            device_id="FOOBAR",
+            is_guest=False,
+            shadow_banned=False,
+            app_service=appservice,
+            authenticated_entity="@appservice:server",
+        )
+        self.get_success(self.auth.check_auth_blocking(requester=requester))
+
+    def test_blocking_mau__appservice_requester_disallowed_when_tracking_ips(self):
+        self.auth_blocking._max_mau_value = 50
+        self.auth_blocking._limit_usage_by_mau = True
+        self.auth_blocking._track_appservice_user_ips = True
+
+        self.store.get_monthly_active_count = simple_async_mock(100)
+        self.store.user_last_seen_monthly_active = simple_async_mock()
+        self.store.is_trial_user = simple_async_mock()
+
+        appservice = ApplicationService(
+            "abcd",
+            self.hs.config.server.server_name,
+            id="1234",
+            namespaces={
+                "users": [{"regex": "@_appservice.*:sender", "exclusive": True}]
+            },
+            sender="@appservice:sender",
+        )
+        requester = Requester(
+            user="@appservice:server",
+            access_token_id=None,
+            device_id="FOOBAR",
+            is_guest=False,
+            shadow_banned=False,
+            app_service=appservice,
+            authenticated_entity="@appservice:server",
+        )
+        self.get_failure(
+            self.auth.check_auth_blocking(requester=requester), ResourceLimitError
+        )
+
     def test_reserved_threepid(self):
         self.auth_blocking._limit_usage_by_mau = True
         self.auth_blocking._max_mau_value = 1
@@ -372,7 +436,7 @@ class AuthTestCase(unittest.HomeserverTestCase):
         self.auth_blocking._hs_disabled = True
         self.auth_blocking._hs_disabled_message = "Reason for being disabled"
         e = self.get_failure(self.auth.check_auth_blocking(), ResourceLimitError)
-        self.assertEquals(e.value.admin_contact, self.hs.config.admin_contact)
+        self.assertEquals(e.value.admin_contact, self.hs.config.server.admin_contact)
         self.assertEquals(e.value.errcode, Codes.RESOURCE_LIMIT_EXCEEDED)
         self.assertEquals(e.value.code, 403)
 
@@ -387,7 +451,7 @@ class AuthTestCase(unittest.HomeserverTestCase):
         self.auth_blocking._hs_disabled = True
         self.auth_blocking._hs_disabled_message = "Reason for being disabled"
         e = self.get_failure(self.auth.check_auth_blocking(), ResourceLimitError)
-        self.assertEquals(e.value.admin_contact, self.hs.config.admin_contact)
+        self.assertEquals(e.value.admin_contact, self.hs.config.server.admin_contact)
         self.assertEquals(e.value.errcode, Codes.RESOURCE_LIMIT_EXCEEDED)
         self.assertEquals(e.value.code, 403)
 

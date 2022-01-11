@@ -44,7 +44,7 @@ COPY synapse/python_dependencies.py /synapse/synapse/python_dependencies.py
 # used while you develop on the source
 #
 # This is aiming at installing the `install_requires` and `extras_require` from `setup.py`
-    RUN pip install --prefix="/install" --no-warn-script-location \
+RUN pip install --prefix="/install" --no-warn-script-location \
     /synapse[all]
 
 # Copy over the rest of the project
@@ -54,6 +54,7 @@ COPY synapse /synapse/synapse/
 #
 # This is aiming at installing only the `packages=find_packages(...)` from `setup.py
 RUN pip install --prefix="/install" --no-deps --no-warn-script-location /synapse
+
 # Install dependencies for synapse-s3-storage-provider module
 #
 # https://github.com/matrix-org/synapse-s3-storage-provider/
@@ -63,6 +64,7 @@ RUN pip install --prefix="/install" --no-warn-script-location boto3
 ###
 
 FROM docker.io/python:${PYTHON_VERSION}-slim
+
 ENV PYTHONPATH=/:$PYTHONPATH
 LABEL org.opencontainers.image.url='https://matrix.org/docs/projects/server/synapse'
 LABEL org.opencontainers.image.documentation='https://github.com/matrix-org/synapse/blob/master/docker/README.md'
@@ -92,5 +94,5 @@ EXPOSE 8008/tcp 8009/tcp 8448/tcp
 
 ENTRYPOINT ["/start.py"]
 
-HEALTHCHECK --interval=1m --timeout=5s \
+HEALTHCHECK --start-period=5s --interval=15s --timeout=5s \
     CMD curl -fSs http://localhost:8008/health || exit 1

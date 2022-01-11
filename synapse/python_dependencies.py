@@ -48,8 +48,10 @@ logger = logging.getLogger(__name__)
 # [1] https://pip.pypa.io/en/stable/reference/pip_install/#requirement-specifiers.
 
 REQUIREMENTS = [
-    "jsonschema>=2.5.1",
-    "frozendict>=1",
+    # we use the TYPE_CHECKER.redefine method added in jsonschema 3.0.0
+    "jsonschema>=3.0.0",
+    # frozendict 2.1.2 is broken on Debian 10: https://github.com/Marco-Sulla/python-frozendict/issues/41
+    "frozendict>=1,<2.1.2",
     "unpaddedbase64>=1.1.0",
     "canonicaljson>=1.4.0",
     # we use the type definitions added in signedjson 1.1.
@@ -75,10 +77,9 @@ REQUIREMENTS = [
     "phonenumbers>=8.2.0",
     # we use GaugeHistogramMetric, which was added in prom-client 0.4.0.
     "prometheus_client>=0.4.0",
-    # we use attr.validators.deep_iterable, which arrived in 19.1.0 (Note:
-    # Fedora 31 only has 19.1, so if we want to upgrade we should wait until 33
-    # is out in November.)
-    "attrs>=19.1.0",
+    # we use `order`, which arrived in attrs 19.2.0.
+    # Note: 21.1.0 broke `/sync`, see #9936
+    "attrs>=19.2.0,!=21.1.0",
     "netaddr>=0.7.18",
     "Jinja2>=2.9",
     "bleach>=1.4.3",
@@ -86,6 +87,8 @@ REQUIREMENTS = [
     # We enforce that we have a `cryptography` version that bundles an `openssl`
     # with the latest security patches.
     "cryptography>=3.4.7",
+    "ijson>=3.1",
+    "matrix-common==1.0.0",
 ]
 
 CONDITIONAL_REQUIREMENTS = {
@@ -95,11 +98,6 @@ CONDITIONAL_REQUIREMENTS = {
         "psycopg2>=2.8 ; platform_python_implementation != 'PyPy'",
         "psycopg2cffi>=2.8 ; platform_python_implementation == 'PyPy'",
         "psycopg2cffi-compat==1.1 ; platform_python_implementation == 'PyPy'",
-    ],
-    # ACME support is required to provision TLS certificates from authorities
-    # that use the protocol, such as Let's Encrypt.
-    "acme": [
-        "txacme>=0.9.2",
     ],
     "saml2": [
         "pysaml2>=4.5.0",
@@ -116,9 +114,11 @@ CONDITIONAL_REQUIREMENTS = {
     # hiredis is not a *strict* dependency, but it makes things much faster.
     # (if it is not installed, we fall back to slow code.)
     "redis": ["txredisapi>=1.4.7", "hiredis"],
+    # Required to use experimental `caches.track_memory_usage` config option.
+    "cache_memory": ["pympler"],
 }
 
-ALL_OPTIONAL_REQUIREMENTS = set()  # type: Set[str]
+ALL_OPTIONAL_REQUIREMENTS: Set[str] = set()
 
 for name, optional_deps in CONDITIONAL_REQUIREMENTS.items():
     # Exclude systemd as it's a system-based requirement.
@@ -196,7 +196,7 @@ def check_requirements(for_feature=None):
     if not for_feature:
         # Check the optional dependencies are up to date. We allow them to not be
         # installed.
-        OPTS = sum(CONDITIONAL_REQUIREMENTS.values(), [])  # type: List[str]
+        OPTS: List[str] = sum(CONDITIONAL_REQUIREMENTS.values(), [])
 
         for dependency in OPTS:
             try:

@@ -15,7 +15,7 @@ from unittest.mock import Mock
 
 from synapse.api.constants import EventTypes
 from synapse.rest import admin
-from synapse.rest.client.v1 import login, room
+from synapse.rest.client import login, room
 from synapse.visibility import filter_events_for_client
 
 from tests import unittest
@@ -228,7 +228,7 @@ class RetentionTestCase(unittest.HomeserverTestCase):
         self.assertIsNotNone(event)
 
         time_now = self.clock.time_msec()
-        serialized = self.get_success(self.serializer.serialize_event(event, time_now))
+        serialized = self.serializer.serialize_event(event, time_now)
 
         return serialized
 

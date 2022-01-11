@@ -13,14 +13,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Iterable
 from unittest import mock
 
+from parameterized import parameterized
 from signedjson import key as key, sign as sign
+
+from twisted.internet import defer
 
 from synapse.api.constants import RoomEncryptionAlgorithms
 from synapse.api.errors import Codes, SynapseError
 
 from tests import unittest
+from tests.test_utils import make_awaitable
 
 
 class E2eKeysHandlerTestCase(unittest.HomeserverTestCase):
@@ -47,12 +52,16 @@ class E2eKeysHandlerTestCase(unittest.HomeserverTestCase):
             "alg2:k3": {"key": "key3"},
         }
 
+        # Note that "signed_curve25519" is always returned in key count responses. This is necessary until
+        # https://github.com/matrix-org/matrix-doc/issues/3298 is fixed.
         res = self.get_success(
             self.handler.upload_keys_for_user(
                 local_user, device_id, {"one_time_keys": keys}
             )
         )
-        self.assertDictEqual(res, {"one_time_key_counts": {"alg1": 1, "alg2": 2}})
+        self.assertDictEqual(
+            res, {"one_time_key_counts": {"alg1": 1, "alg2": 2, "signed_curve25519": 0}}
+        )
 
         # we should be able to change the signature without a problem
         keys["alg2:k2"]["signatures"]["k1"] = "sig2"
@@ -61,7 +70,9 @@ class E2eKeysHandlerTestCase(unittest.HomeserverTestCase):
                 local_user, device_id, {"one_time_keys": keys}
             )
         )
-        self.assertDictEqual(res, {"one_time_key_counts": {"alg1": 1, "alg2": 2}})
+        self.assertDictEqual(
+            res, {"one_time_key_counts": {"alg1": 1, "alg2": 2, "signed_curve25519": 0}}
+        )
 
     def test_change_one_time_keys(self):
         """attempts to change one-time-keys should be rejected"""
@@ -79,7 +90,9 @@ class E2eKeysHandlerTestCase(unittest.HomeserverTestCase):
                 local_user, device_id, {"one_time_keys": keys}
             )
         )
-        self.assertDictEqual(res, {"one_time_key_counts": {"alg1": 1, "alg2": 2}})
+        self.assertDictEqual(
+            res, {"one_time_key_counts": {"alg1": 1, "alg2": 2, "signed_curve25519": 0}}
+        )
 
         # Error when changing string key
         self.get_failure(
@@ -89,7 +102,7 @@ class E2eKeysHandlerTestCase(unittest.HomeserverTestCase):
             SynapseError,
         )
 
-        # Error when replacing dict key with strin
+        # Error when replacing dict key with string
         self.get_failure(
             self.handler.upload_keys_for_user(
                 local_user, device_id, {"one_time_keys": {"alg2:k3": "key2"}}
@@ -131,7 +144,9 @@ class E2eKeysHandlerTestCase(unittest.HomeserverTestCase):
                 local_user, device_id, {"one_time_keys": keys}
             )
         )
-        self.assertDictEqual(res, {"one_time_key_counts": {"alg1": 1}})
+        self.assertDictEqual(
+            res, {"one_time_key_counts": {"alg1": 1, "signed_curve25519": 0}}
+        )
 
         res2 = self.get_success(
             self.handler.claim_one_time_keys(
@@ -149,7 +164,9 @@ class E2eKeysHandlerTestCase(unittest.HomeserverTestCase):
     def test_fallback_key(self):
         local_user = "@boris:" + self.hs.hostname
         device_id = "xyz"
-        fallback_key = {"alg1:k1": "key1"}
+        fallback_key = {"alg1:k1": "fallback_key1"}
+        fallback_key2 = {"alg1:k2": "fallback_key2"}
+        fallback_key3 = {"alg1:k2": "fallback_key3"}
         otk = {"alg1:k2": "key2"}
 
         # we shouldn't have any unused fallback keys yet
@@ -162,7 +179,7 @@ class E2eKeysHandlerTestCase(unittest.HomeserverTestCase):
             self.handler.upload_keys_for_user(
                 local_user,
                 device_id,
-                {"org.matrix.msc2732.fallback_keys": fallback_key},
+                {"fallback_keys": fallback_key},
             )
         )
 
@@ -201,6 +218,35 @@ class E2eKeysHandlerTestCase(unittest.HomeserverTestCase):
             {"failures": {}, "one_time_keys": {local_user: {device_id: fallback_key}}},
         )
 
+        # re-uploading the same fallback key should still result in no unused fallback
+        # keys
+        self.get_success(
+            self.handler.upload_keys_for_user(
+                local_user,
+                device_id,
+                {"fallback_keys": fallback_key},
+            )
+        )
+
+        res = self.get_success(
+            self.store.get_e2e_unused_fallback_key_types(local_user, device_id)
+        )
+        self.assertEqual(res, [])
+
+        # uploading a new fallback key should result in an unused fallback key
+        self.get_success(
+            self.handler.upload_keys_for_user(
+                local_user,
+                device_id,
+                {"fallback_keys": fallback_key2},
+            )
+        )
+
+        res = self.get_success(
+            self.store.get_e2e_unused_fallback_key_types(local_user, device_id)
+        )
+        self.assertEqual(res, ["alg1"])
+
         # if the user uploads a one-time key, the next claim should fetch the
         # one-time key, and then go back to the fallback
         self.get_success(
@@ -226,7 +272,26 @@ class E2eKeysHandlerTestCase(unittest.HomeserverTestCase):
         )
         self.assertEqual(
             res,
-            {"failures": {}, "one_time_keys": {local_user: {device_id: fallback_key}}},
+            {"failures": {}, "one_time_keys": {local_user: {device_id: fallback_key2}}},
+        )
+
+        # using the unstable prefix should also set the fallback key
+        self.get_success(
+            self.handler.upload_keys_for_user(
+                local_user,
+                device_id,
+                {"org.matrix.msc2732.fallback_keys": fallback_key3},
+            )
+        )
+
+        res = self.get_success(
+            self.handler.claim_one_time_keys(
+                {"one_time_keys": {local_user: {device_id: "alg1"}}}, timeout=None
+            )
+        )
+        self.assertEqual(
+            res,
+            {"failures": {}, "one_time_keys": {local_user: {device_id: fallback_key3}}},
         )
 
     def test_replace_master_key(self):
@@ -257,7 +322,9 @@ class E2eKeysHandlerTestCase(unittest.HomeserverTestCase):
         self.get_success(self.handler.upload_signing_keys_for_user(local_user, keys2))
 
         devices = self.get_success(
-            self.handler.query_devices({"device_keys": {local_user: []}}, 0, local_user)
+            self.handler.query_devices(
+                {"device_keys": {local_user: []}}, 0, local_user, "device123"
+            )
         )
         self.assertDictEqual(devices["master_keys"], {local_user: keys2["master_key"]})
 
@@ -357,7 +424,9 @@ class E2eKeysHandlerTestCase(unittest.HomeserverTestCase):
         device_key_1["signatures"][local_user]["ed25519:abc"] = "base64+signature"
         device_key_2["signatures"][local_user]["ed25519:def"] = "base64+signature"
         devices = self.get_success(
-            self.handler.query_devices({"device_keys": {local_user: []}}, 0, local_user)
+            self.handler.query_devices(
+                {"device_keys": {local_user: []}}, 0, local_user, "device123"
+            )
         )
         del devices["device_keys"][local_user]["abc"]["unsigned"]
         del devices["device_keys"][local_user]["def"]["unsigned"]
@@ -591,7 +660,10 @@ class E2eKeysHandlerTestCase(unittest.HomeserverTestCase):
         # fetch the signed keys/devices and make sure that the signatures are there
         ret = self.get_success(
             self.handler.query_devices(
-                {"device_keys": {local_user: [], other_user: []}}, 0, local_user
+                {"device_keys": {local_user: [], other_user: []}},
+                0,
+                local_user,
+                "device123",
             )
         )
 
@@ -613,3 +685,245 @@ class E2eKeysHandlerTestCase(unittest.HomeserverTestCase):
             ],
             other_master_key["signatures"][local_user]["ed25519:" + usersigning_pubkey],
         )
+
+    def test_query_devices_remote_no_sync(self):
+        """Tests that querying keys for a remote user that we don't share a room
+        with returns the cross signing keys correctly.
+        """
+
+        remote_user_id = "@test:other"
+        local_user_id = "@test:test"
+
+        remote_master_key = "85T7JXPFBAySB/jwby4S3lBPTqY3+Zg53nYuGmu1ggY"
+        remote_self_signing_key = "QeIiFEjluPBtI7WQdG365QKZcFs9kqmHir6RBD0//nQ"
+
+        self.hs.get_federation_client().query_client_keys = mock.Mock(
+            return_value=defer.succeed(
+                {
+                    "device_keys": {remote_user_id: {}},
+                    "master_keys": {
+                        remote_user_id: {
+                            "user_id": remote_user_id,
+                            "usage": ["master"],
+                            "keys": {"ed25519:" + remote_master_key: remote_master_key},
+                        },
+                    },
+                    "self_signing_keys": {
+                        remote_user_id: {
+                            "user_id": remote_user_id,
+                            "usage": ["self_signing"],
+                            "keys": {
+                                "ed25519:"
+                                + remote_self_signing_key: remote_self_signing_key
+                            },
+                        }
+                    },
+                }
+            )
+        )
+
+        e2e_handler = self.hs.get_e2e_keys_handler()
+
+        query_result = self.get_success(
+            e2e_handler.query_devices(
+                {
+                    "device_keys": {remote_user_id: []},
+                },
+                timeout=10,
+                from_user_id=local_user_id,
+                from_device_id="some_device_id",
+            )
+        )
+
+        self.assertEqual(query_result["failures"], {})
+        self.assertEqual(
+            query_result["master_keys"],
+            {
+                remote_user_id: {
+                    "user_id": remote_user_id,
+                    "usage": ["master"],
+                    "keys": {"ed25519:" + remote_master_key: remote_master_key},
+                },
+            },
+        )
+        self.assertEqual(
+            query_result["self_signing_keys"],
+            {
+                remote_user_id: {
+                    "user_id": remote_user_id,
+                    "usage": ["self_signing"],
+                    "keys": {
+                        "ed25519:" + remote_self_signing_key: remote_self_signing_key
+                    },
+                }
+            },
+        )
+
+    def test_query_devices_remote_sync(self):
+        """Tests that querying keys for a remote user that we share a room with,
+        but haven't yet fetched the keys for, returns the cross signing keys
+        correctly.
+        """
+
+        remote_user_id = "@test:other"
+        local_user_id = "@test:test"
+
+        # Pretend we're sharing a room with the user we're querying. If not,
+        # `_query_devices_for_destination` will return early.
+        self.store.get_rooms_for_user = mock.Mock(
+            return_value=defer.succeed({"some_room_id"})
+        )
+
+        remote_master_key = "85T7JXPFBAySB/jwby4S3lBPTqY3+Zg53nYuGmu1ggY"
+        remote_self_signing_key = "QeIiFEjluPBtI7WQdG365QKZcFs9kqmHir6RBD0//nQ"
+
+        self.hs.get_federation_client().query_user_devices = mock.Mock(
+            return_value=defer.succeed(
+                {
+                    "user_id": remote_user_id,
+                    "stream_id": 1,
+                    "devices": [],
+                    "master_key": {
+                        "user_id": remote_user_id,
+                        "usage": ["master"],
+                        "keys": {"ed25519:" + remote_master_key: remote_master_key},
+                    },
+                    "self_signing_key": {
+                        "user_id": remote_user_id,
+                        "usage": ["self_signing"],
+                        "keys": {
+                            "ed25519:"
+                            + remote_self_signing_key: remote_self_signing_key
+                        },
+                    },
+                }
+            )
+        )
+
+        e2e_handler = self.hs.get_e2e_keys_handler()
+
+        query_result = self.get_success(
+            e2e_handler.query_devices(
+                {
+                    "device_keys": {remote_user_id: []},
+                },
+                timeout=10,
+                from_user_id=local_user_id,
+                from_device_id="some_device_id",
+            )
+        )
+
+        self.assertEqual(query_result["failures"], {})
+        self.assertEqual(
+            query_result["master_keys"],
+            {
+                remote_user_id: {
+                    "user_id": remote_user_id,
+                    "usage": ["master"],
+                    "keys": {"ed25519:" + remote_master_key: remote_master_key},
+                }
+            },
+        )
+        self.assertEqual(
+            query_result["self_signing_keys"],
+            {
+                remote_user_id: {
+                    "user_id": remote_user_id,
+                    "usage": ["self_signing"],
+                    "keys": {
+                        "ed25519:" + remote_self_signing_key: remote_self_signing_key
+                    },
+                }
+            },
+        )
+
+    @parameterized.expand(
+        [
+            # The remote homeserver's response indicates that this user has 0/1/2 devices.
+            ([],),
+            (["device_1"],),
+            (["device_1", "device_2"],),
+        ]
+    )
+    def test_query_all_devices_caches_result(self, device_ids: Iterable[str]):
+        """Test that requests for all of a remote user's devices are cached.
+
+        We do this by asserting that only one call over federation was made, and that
+        the two queries to the local homeserver produce the same response.
+        """
+        local_user_id = "@test:test"
+        remote_user_id = "@test:other"
+        request_body = {"device_keys": {remote_user_id: []}}
+
+        response_devices = [
+            {
+                "device_id": device_id,
+                "keys": {
+                    "algorithms": ["dummy"],
+                    "device_id": device_id,
+                    "keys": {f"dummy:{device_id}": "dummy"},
+                    "signatures": {device_id: {f"dummy:{device_id}": "dummy"}},
+                    "unsigned": {},
+                    "user_id": "@test:other",
+                },
+            }
+            for device_id in device_ids
+        ]
+
+        response_body = {
+            "devices": response_devices,
+            "user_id": remote_user_id,
+            "stream_id": 12345,  # an integer, according to the spec
+        }
+
+        e2e_handler = self.hs.get_e2e_keys_handler()
+
+        # Pretend we're sharing a room with the user we're querying. If not,
+        # `_query_devices_for_destination` will return early.
+        mock_get_rooms = mock.patch.object(
+            self.store,
+            "get_rooms_for_user",
+            new_callable=mock.MagicMock,
+            return_value=make_awaitable(["some_room_id"]),
+        )
+        mock_request = mock.patch.object(
+            self.hs.get_federation_client(),
+            "query_user_devices",
+            new_callable=mock.MagicMock,
+            return_value=make_awaitable(response_body),
+        )
+
+        with mock_get_rooms, mock_request as mocked_federation_request:
+            # Make the first query and sanity check it succeeds.
+            response_1 = self.get_success(
+                e2e_handler.query_devices(
+                    request_body,
+                    timeout=10,
+                    from_user_id=local_user_id,
+                    from_device_id="some_device_id",
+                )
+            )
+            self.assertEqual(response_1["failures"], {})
+
+            # We should have made a federation request to do so.
+            mocked_federation_request.assert_called_once()
+
+            # Reset the mock so we can prove we don't make a second federation request.
+            mocked_federation_request.reset_mock()
+
+            # Repeat the query.
+            response_2 = self.get_success(
+                e2e_handler.query_devices(
+                    request_body,
+                    timeout=10,
+                    from_user_id=local_user_id,
+                    from_device_id="some_device_id",
+                )
+            )
+            self.assertEqual(response_2["failures"], {})
+
+            # We should not have made a second federation request.
+            mocked_federation_request.assert_not_called()
+
+            # The two requests to the local homeserver should be identical.
+            self.assertEqual(response_1, response_2)
