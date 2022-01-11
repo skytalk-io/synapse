@@ -32,20 +32,6 @@ jobs:
       - name: Check line endings
         run: scripts-dev/check_line_terminators.sh
 
-  lint-newsfile:
-    if: ${{ github.base_ref == 'develop'  || contains(github.base_ref, 'release-') }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
-      - uses: actions/setup-python@v2
-      - run: pip install tox
-      - run: scripts-dev/check-newsfragment
-        env:
-          PULL_REQUEST_NUMBER: ${{ github.event.number }}
-
   lint-sdist:
     runs-on: ubuntu-latest
     steps:
