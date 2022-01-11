@@ -1,0 +1,97 @@
+name: Build
+
+on:
+  pull_request:
+    branches: ["develop"]
+
+env:
+  DOCKER_IMAGE_NAME: docker.io/ciliconherve/synapse
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toxenv:
+          - "check-sampleconfig"
+          - "check_codestyle"
+          - "check_isort"
+          - "mypy"
+          - "packaging"
+
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-python@v2
+      - run: pip install tox
+      - run: tox -e ${{ matrix.toxenv }}
+
+  lint-crlf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Check line endings
+        run: scripts-dev/check_line_terminators.sh
+
+  lint-newsfile:
+    if: ${{ github.base_ref == 'develop'  || contains(github.base_ref, 'release-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v2
+      - run: pip install tox
+      - run: scripts-dev/check-newsfragment
+        env:
+          PULL_REQUEST_NUMBER: ${{ github.event.number }}
+
+  lint-sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-python@v2
+        with:
+          python-version: "3.x"
+      - run: pip install wheel
+      - run: python setup.py sdist bdist_wheel
+      - uses: actions/upload-artifact@v2
+        with:
+          name: Python Distributions
+          path: dist/*
+
+  # Dummy step to gate other tests on without repeating the whole list
+  linting-done:
+    if: ${{ always() }} # Run this even if prior jobs were skipped
+    needs: [lint, lint-crlf, lint-newsfile, lint-sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - run: "true"
+
+  containerize:
+    if: ${{ !failure() }} # Allow previous steps to be skipped, but not fail
+    needs: linting-done
+    name: Build image
+    runs-on: ubuntu-latest
+    steps:
+
+    - name: Check out code
+      uses: actions/checkout@v2
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v1
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v1
+
+    - uses: actions/checkout@v2
+
+    - name: Build image
+      uses: docker/build-push-action@v2
+      with:
+        context: .
+        file: docker/Dockerfile
+        platforms: linux/amd64,linux/arm64
+        push: false
+        tags: |
+          ${{ env.DOCKER_IMAGE_NAME }}:latest

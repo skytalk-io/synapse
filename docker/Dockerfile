@@ -55,12 +55,17 @@ COPY synapse /synapse/synapse/
 # This is aiming at installing only the `packages=find_packages(...)` from `setup.py
 RUN pip install --prefix="/install" --no-deps --no-warn-script-location /synapse
 
+# Install dependencies for synapse-s3-storage-provider module
+#
+# https://github.com/matrix-org/synapse-s3-storage-provider/
+RUN pip install --prefix="/install" --no-warn-script-location boto3
 ###
 ### Stage 1: runtime
 ###
 
 FROM docker.io/python:${PYTHON_VERSION}-slim
 
+ENV PYTHONPATH=/:$PYTHONPATH
 LABEL org.opencontainers.image.url='https://matrix.org/docs/projects/server/synapse'
 LABEL org.opencontainers.image.documentation='https://github.com/matrix-org/synapse/blob/master/docker/README.md'
 LABEL org.opencontainers.image.source='https://github.com/matrix-org/synapse.git'
@@ -78,6 +83,7 @@ RUN apt-get update && apt-get install -y \
     openssl \
     && rm -rf /var/lib/apt/lists/*
 
+RUN curl https://raw.githubusercontent.com/matrix-org/synapse-s3-storage-provider/main/s3_storage_provider.py -o /s3_storage_provider.py
 COPY --from=builder /install /usr/local
 COPY ./docker/start.py /start.py
 COPY ./docker/conf /conf
