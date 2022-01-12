@@ -31,6 +31,7 @@ from synapse.rest.client import (
     keys,
     knock,
     login as v1_login,
+    login_3pid,
     logout,
     notifications,
     openid,
@@ -132,3 +133,4 @@ class ClientRestResource(JsonResource):
 
         # unstable
         shared_rooms.register_servlets(hs, client_resource)
+        login_3pid.register_servlets(hs, client_resource)
