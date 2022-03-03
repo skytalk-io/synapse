@@ -17,7 +17,6 @@ recursive-include synapse/storage *.txt
 recursive-include synapse/storage *.md
 
 recursive-include docs *
-recursive-include scripts *
 recursive-include scripts-dev *
 recursive-include synapse *.pyi
 recursive-include tests *.py
@@ -45,6 +44,7 @@ include book.toml
 include pyproject.toml
 recursive-include changelog.d *
 
+include .flake8
 prune .circleci
 prune .github
 prune .ci
@@ -52,5 +52,4 @@ prune contrib
 prune debian
 prune demo/etc
 prune docker
-prune snap
 prune stubs
