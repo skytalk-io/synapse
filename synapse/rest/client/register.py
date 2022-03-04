@@ -918,11 +918,11 @@ def _calculate_registration_flows(
         flows.append([LoginType.DUMMY])
 
     # only support the email-only flow if we don't require MSISDN 3PIDs
-    if show_email and not require_msisdn:
+    if show_email and require_email:
         flows.append([LoginType.EMAIL_IDENTITY])
 
     # only support the MSISDN-only flow if we don't require email 3PIDs
-    if show_msisdn and not require_email:
+    if show_msisdn and require_msisdn:
         flows.append([LoginType.MSISDN])
 
     if show_email and show_msisdn:
