@@ -409,6 +409,9 @@ class HttpPusher(Pusher):
         if self.hs.config.push.push_include_content and event.content:
             d["notification"]["content"] = event.content
 
+        if event.redacts is not None:
+            d["notification"]["redacts"] = event.redacts
+
         # We no longer send aliases separately, instead, we send the human
         # readable name of the room, which may be an alias.
         if "sender_display_name" in ctx and len(ctx["sender_display_name"]) > 0:
