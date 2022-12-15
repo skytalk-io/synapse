@@ -31,7 +31,6 @@ from synapse.rest.client import (
     knock,
     login,
     login_token_request,
-    login_3pid,
     logout,
     mutual_rooms,
     notifications,
@@ -152,4 +151,3 @@ class ClientRestResource(JsonResource):
             mutual_rooms.register_servlets(hs, client_resource)
             login_token_request.register_servlets(hs, client_resource)
             rendezvous.register_servlets(hs, client_resource)
-            login_3pid.register_servlets(hs, client_resource)
