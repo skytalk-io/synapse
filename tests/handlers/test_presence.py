@@ -15,6 +15,7 @@
 from typing import Optional
 from unittest.mock import Mock, call
 
+from parameterized import parameterized
 from signedjson.key import generate_signing_key
 
 from synapse.api.constants import EventTypes, Membership, PresenceState
@@ -37,6 +38,7 @@ from synapse.rest.client import room
 from synapse.types import UserID, get_domain_from_id
 
 from tests import unittest
+from tests.replication._base import BaseMultiWorkerStreamTestCase
 
 
 class PresenceUpdateTestCase(unittest.HomeserverTestCase):
@@ -331,11 +333,11 @@ class PresenceUpdateTestCase(unittest.HomeserverTestCase):
 
         # Extract presence update user ID and state information into lists of tuples
         db_presence_states = [(ps[0], ps[1]) for _, ps in db_presence_states[0]]
-        presence_states = [(ps.user_id, ps.state) for ps in presence_states]
+        presence_states_compare = [(ps.user_id, ps.state) for ps in presence_states]
 
         # Compare what we put into the storage with what we got out.
         # They should be identical.
-        self.assertEqual(presence_states, db_presence_states)
+        self.assertEqual(presence_states_compare, db_presence_states)
 
 
 class PresenceTimeoutTestCase(unittest.TestCase):
@@ -357,6 +359,7 @@ class PresenceTimeoutTestCase(unittest.TestCase):
         new_state = handle_timeout(state, is_mine=True, syncing_user_ids=set(), now=now)
 
         self.assertIsNotNone(new_state)
+        assert new_state is not None
         self.assertEqual(new_state.state, PresenceState.UNAVAILABLE)
         self.assertEqual(new_state.status_msg, status_msg)
 
@@ -380,6 +383,7 @@ class PresenceTimeoutTestCase(unittest.TestCase):
         new_state = handle_timeout(state, is_mine=True, syncing_user_ids=set(), now=now)
 
         self.assertIsNotNone(new_state)
+        assert new_state is not None
         self.assertEqual(new_state.state, PresenceState.BUSY)
         self.assertEqual(new_state.status_msg, status_msg)
 
@@ -399,6 +403,7 @@ class PresenceTimeoutTestCase(unittest.TestCase):
         new_state = handle_timeout(state, is_mine=True, syncing_user_ids=set(), now=now)
 
         self.assertIsNotNone(new_state)
+        assert new_state is not None
         self.assertEqual(new_state.state, PresenceState.OFFLINE)
         self.assertEqual(new_state.status_msg, status_msg)
 
@@ -420,6 +425,7 @@ class PresenceTimeoutTestCase(unittest.TestCase):
         )
 
         self.assertIsNotNone(new_state)
+        assert new_state is not None
         self.assertEqual(new_state.state, PresenceState.ONLINE)
         self.assertEqual(new_state.status_msg, status_msg)
 
@@ -477,6 +483,7 @@ class PresenceTimeoutTestCase(unittest.TestCase):
         )
 
         self.assertIsNotNone(new_state)
+        assert new_state is not None
         self.assertEqual(new_state.state, PresenceState.OFFLINE)
         self.assertEqual(new_state.status_msg, status_msg)
 
@@ -500,7 +507,7 @@ class PresenceTimeoutTestCase(unittest.TestCase):
         self.assertEqual(state, new_state)
 
 
-class PresenceHandlerTestCase(unittest.HomeserverTestCase):
+class PresenceHandlerTestCase(BaseMultiWorkerStreamTestCase):
     def prepare(self, reactor, clock, hs):
         self.presence_handler = hs.get_presence_handler()
         self.clock = hs.get_clock()
@@ -652,14 +659,120 @@ class PresenceHandlerTestCase(unittest.HomeserverTestCase):
         # Mark user as online and `status_msg = None`
         self._set_presencestate_with_status_msg(user_id, PresenceState.ONLINE, None)
 
+    def test_set_presence_from_syncing_not_set(self):
+        """Test that presence is not set by syncing if affect_presence is false"""
+        user_id = "@test:server"
+        status_msg = "I'm here!"
+
+        self._set_presencestate_with_status_msg(
+            user_id, PresenceState.UNAVAILABLE, status_msg
+        )
+
+        self.get_success(
+            self.presence_handler.user_syncing(user_id, False, PresenceState.ONLINE)
+        )
+
+        state = self.get_success(
+            self.presence_handler.get_state(UserID.from_string(user_id))
+        )
+        # we should still be unavailable
+        self.assertEqual(state.state, PresenceState.UNAVAILABLE)
+        # and status message should still be the same
+        self.assertEqual(state.status_msg, status_msg)
+
+    def test_set_presence_from_syncing_is_set(self):
+        """Test that presence is set by syncing if affect_presence is true"""
+        user_id = "@test:server"
+        status_msg = "I'm here!"
+
+        self._set_presencestate_with_status_msg(
+            user_id, PresenceState.UNAVAILABLE, status_msg
+        )
+
+        self.get_success(
+            self.presence_handler.user_syncing(user_id, True, PresenceState.ONLINE)
+        )
+
+        state = self.get_success(
+            self.presence_handler.get_state(UserID.from_string(user_id))
+        )
+        # we should now be online
+        self.assertEqual(state.state, PresenceState.ONLINE)
+
+    def test_set_presence_from_syncing_keeps_status(self):
+        """Test that presence set by syncing retains status message"""
+        user_id = "@test:server"
+        status_msg = "I'm here!"
+
+        self._set_presencestate_with_status_msg(
+            user_id, PresenceState.UNAVAILABLE, status_msg
+        )
+
+        self.get_success(
+            self.presence_handler.user_syncing(user_id, True, PresenceState.ONLINE)
+        )
+
+        state = self.get_success(
+            self.presence_handler.get_state(UserID.from_string(user_id))
+        )
+        # our status message should be the same as it was before
+        self.assertEqual(state.status_msg, status_msg)
+
+    @parameterized.expand([(False,), (True,)])
+    @unittest.override_config(
+        {
+            "experimental_features": {
+                "msc3026_enabled": True,
+            },
+        }
+    )
+    def test_set_presence_from_syncing_keeps_busy(self, test_with_workers: bool):
+        """Test that presence set by syncing doesn't affect busy status
+
+        Args:
+            test_with_workers: If True, check the presence state of the user by calling
+                /sync against a worker, rather than the main process.
+        """
+        user_id = "@test:server"
+        status_msg = "I'm busy!"
+
+        # By default, we call /sync against the main process.
+        worker_to_sync_against = self.hs
+        if test_with_workers:
+            # Create a worker and use it to handle /sync traffic instead.
+            # This is used to test that presence changes get replicated from workers
+            # to the main process correctly.
+            worker_to_sync_against = self.make_worker_hs(
+                "synapse.app.generic_worker", {"worker_name": "presence_writer"}
+            )
+
+        # Set presence to BUSY
+        self._set_presencestate_with_status_msg(user_id, PresenceState.BUSY, status_msg)
+
+        # Perform a sync with a presence state other than busy. This should NOT change
+        # our presence status; we only change from busy if we explicitly set it via
+        # /presence/*.
+        self.get_success(
+            worker_to_sync_against.get_presence_handler().user_syncing(
+                user_id, True, PresenceState.ONLINE
+            )
+        )
+
+        # Check against the main process that the user's presence did not change.
+        state = self.get_success(
+            self.presence_handler.get_state(UserID.from_string(user_id))
+        )
+        # we should still be busy
+        self.assertEqual(state.state, PresenceState.BUSY)
+
     def _set_presencestate_with_status_msg(
-        self, user_id: str, state: PresenceState, status_msg: Optional[str]
+        self, user_id: str, state: str, status_msg: Optional[str]
     ):
         """Set a PresenceState and status_msg and check the result.
 
         Args:
             user_id: User for that the status is to be set.
-            PresenceState: The new PresenceState.
+            state: The new PresenceState.
             status_msg: Status message that is to be set.
         """
         self.get_success(
@@ -879,7 +992,8 @@ class PresenceJoinTestCase(unittest.HomeserverTestCase):
 
     def default_config(self):
         config = super().default_config()
-        config["send_federation"] = True
+        # Enable federation sending on the main process.
+        config["federation_sender_instances"] = None
         return config
 
     def prepare(self, reactor, clock, hs):

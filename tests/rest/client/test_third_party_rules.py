@@ -20,8 +20,8 @@ from twisted.test.proto_helpers import MemoryReactor
 from synapse.api.constants import EventTypes, LoginType, Membership
 from synapse.api.errors import SynapseError
 from synapse.api.room_versions import RoomVersion
+from synapse.config.homeserver import HomeServerConfig
 from synapse.events import EventBase
-from synapse.events.snapshot import EventContext
 from synapse.events.third_party_rules import load_legacy_third_party_event_rules
 from synapse.rest import admin
 from synapse.rest.client import account, login, profile, room
@@ -113,14 +113,8 @@ class ThirdPartyRulesTestCase(unittest.FederatingHomeserverTestCase):
 
         # Have this homeserver skip event auth checks. This is necessary due to
         # event auth checks ensuring that events were signed by the sender's homeserver.
-        async def _check_event_auth(
-            origin: str,
-            event: EventBase,
-            context: EventContext,
-            *args: Any,
-            **kwargs: Any,
-        ) -> EventContext:
-            return context
+        async def _check_event_auth(origin: Any, event: Any, context: Any) -> None:
+            pass
 
         hs.get_federation_event_handler()._check_event_auth = _check_event_auth  # type: ignore[assignment]
 
@@ -161,7 +155,7 @@ class ThirdPartyRulesTestCase(unittest.FederatingHomeserverTestCase):
             {},
             access_token=self.tok,
         )
-        self.assertEqual(channel.result["code"], b"200", channel.result)
+        self.assertEqual(channel.code, 200, channel.result)
 
         callback.assert_called_once()
 
@@ -179,7 +173,7 @@ class ThirdPartyRulesTestCase(unittest.FederatingHomeserverTestCase):
             {},
             access_token=self.tok,
         )
-        self.assertEqual(channel.result["code"], b"403", channel.result)
+        self.assertEqual(channel.code, 403, channel.result)
 
     def test_third_party_rules_workaround_synapse_errors_pass_through(self) -> None:
         """
@@ -192,12 +186,12 @@ class ThirdPartyRulesTestCase(unittest.FederatingHomeserverTestCase):
         """
 
         class NastyHackException(SynapseError):
-            def error_dict(self) -> JsonDict:
+            def error_dict(self, config: Optional[HomeServerConfig]) -> JsonDict:
                 """
                 This overrides SynapseError's `error_dict` to nastily inject
                 JSON into the error response.
                 """
-                result = super().error_dict()
+                result = super().error_dict(config)
                 result["nasty"] = "very"
                 return result
 
@@ -217,7 +211,7 @@ class ThirdPartyRulesTestCase(unittest.FederatingHomeserverTestCase):
             access_token=self.tok,
         )
         # Check the error code
-        self.assertEqual(channel.result["code"], b"429", channel.result)
+        self.assertEqual(channel.code, 429, channel.result)
         # Check the JSON body has had the `nasty` key injected
         self.assertEqual(
             channel.json_body,
@@ -266,7 +260,7 @@ class ThirdPartyRulesTestCase(unittest.FederatingHomeserverTestCase):
             {"x": "x"},
             access_token=self.tok,
         )
-        self.assertEqual(channel.result["code"], b"200", channel.result)
+        self.assertEqual(channel.code, 200, channel.result)
         event_id = channel.json_body["event_id"]
 
         # ... and check that it got modified
@@ -275,7 +269,7 @@ class ThirdPartyRulesTestCase(unittest.FederatingHomeserverTestCase):
             "/_matrix/client/r0/rooms/%s/event/%s" % (self.room_id, event_id),
             access_token=self.tok,
         )
-        self.assertEqual(channel.result["code"], b"200", channel.result)
+        self.assertEqual(channel.code, 200, channel.result)
         ev = channel.json_body
         self.assertEqual(ev["content"]["x"], "y")
 
@@ -304,7 +298,7 @@ class ThirdPartyRulesTestCase(unittest.FederatingHomeserverTestCase):
             },
             access_token=self.tok,
         )
-        self.assertEqual(channel.result["code"], b"200", channel.result)
+        self.assertEqual(channel.code, 200, channel.result)
         orig_event_id = channel.json_body["event_id"]
 
         channel = self.make_request(
@@ -321,7 +315,7 @@ class ThirdPartyRulesTestCase(unittest.FederatingHomeserverTestCase):
             },
             access_token=self.tok,
         )
-        self.assertEqual(channel.result["code"], b"200", channel.result)
+        self.assertEqual(channel.code, 200, channel.result)
         edited_event_id = channel.json_body["event_id"]
 
         # ... and check that they both got modified
@@ -330,7 +324,7 @@ class ThirdPartyRulesTestCase(unittest.FederatingHomeserverTestCase):
             "/_matrix/client/r0/rooms/%s/event/%s" % (self.room_id, orig_event_id),
             access_token=self.tok,
         )
-        self.assertEqual(channel.result["code"], b"200", channel.result)
+        self.assertEqual(channel.code, 200, channel.result)
         ev = channel.json_body
         self.assertEqual(ev["content"]["body"], "ORIGINAL BODY")
 
@@ -339,7 +333,7 @@ class ThirdPartyRulesTestCase(unittest.FederatingHomeserverTestCase):
             "/_matrix/client/r0/rooms/%s/event/%s" % (self.room_id, edited_event_id),
             access_token=self.tok,
         )
-        self.assertEqual(channel.result["code"], b"200", channel.result)
+        self.assertEqual(channel.code, 200, channel.result)
         ev = channel.json_body
         self.assertEqual(ev["content"]["body"], "EDITED BODY")
 
@@ -385,7 +379,7 @@ class ThirdPartyRulesTestCase(unittest.FederatingHomeserverTestCase):
             },
             access_token=self.tok,
         )
-        self.assertEqual(channel.result["code"], b"200", channel.result)
+        self.assertEqual(channel.code, 200, channel.result)
 
         event_id = channel.json_body["event_id"]
 
@@ -394,7 +388,7 @@ class ThirdPartyRulesTestCase(unittest.FederatingHomeserverTestCase):
             "/_matrix/client/r0/rooms/%s/event/%s" % (self.room_id, event_id),
             access_token=self.tok,
         )
-        self.assertEqual(channel.result["code"], b"200", channel.result)
+        self.assertEqual(channel.code, 200, channel.result)
 
         self.assertIn("foo", channel.json_body["content"].keys())
         self.assertEqual(channel.json_body["content"]["foo"], "bar")
@@ -775,3 +769,165 @@ class ThirdPartyRulesTestCase(unittest.FederatingHomeserverTestCase):
         self.assertEqual(args[0], user_id)
         self.assertFalse(args[1])
         self.assertTrue(args[2])
+
+    def test_check_can_deactivate_user(self) -> None:
+        """Tests that the on_user_deactivation_status_changed module callback is called
+        correctly when processing a user's deactivation.
+        """
+        # Register a mocked callback.
+        deactivation_mock = Mock(return_value=make_awaitable(False))
+        third_party_rules = self.hs.get_third_party_event_rules()
+        third_party_rules._check_can_deactivate_user_callbacks.append(
+            deactivation_mock,
+        )
+
+        # Register a user that we'll deactivate.
+        user_id = self.register_user("altan", "password")
+        tok = self.login("altan", "password")
+
+        # Deactivate that user.
+        channel = self.make_request(
+            "POST",
+            "/_matrix/client/v3/account/deactivate",
+            {
+                "auth": {
+                    "type": LoginType.PASSWORD,
+                    "password": "password",
+                    "identifier": {
+                        "type": "m.id.user",
+                        "user": user_id,
+                    },
+                },
+                "erase": True,
+            },
+            access_token=tok,
+        )
+
+        # Check that the deactivation was blocked
+        self.assertEqual(channel.code, 403, channel.json_body)
+
+        # Check that the mock was called once.
+        deactivation_mock.assert_called_once()
+        args = deactivation_mock.call_args[0]
+
+        # Check that the mock was called with the right user ID
+        self.assertEqual(args[0], user_id)
+
+        # Check that the request was not made by an admin
+        self.assertEqual(args[1], False)
+
+    def test_check_can_deactivate_user_admin(self) -> None:
+        """Tests that the on_user_deactivation_status_changed module callback is called
+        correctly when processing a user's deactivation triggered by a server admin.
+        """
+        # Register a mocked callback.
+        deactivation_mock = Mock(return_value=make_awaitable(False))
+        third_party_rules = self.hs.get_third_party_event_rules()
+        third_party_rules._check_can_deactivate_user_callbacks.append(
+            deactivation_mock,
+        )
+
+        # Register an admin user.
+        self.register_user("admin", "password", admin=True)
+        admin_tok = self.login("admin", "password")
+
+        # Register a user that we'll deactivate.
+        user_id = self.register_user("altan", "password")
+
+        # Deactivate the user.
+        channel = self.make_request(
+            "PUT",
+            "/_synapse/admin/v2/users/%s" % user_id,
+            {"deactivated": True},
+            access_token=admin_tok,
+        )
+
+        # Check that the deactivation was blocked
+        self.assertEqual(channel.code, 403, channel.json_body)
+
+        # Check that the mock was called once.
+        deactivation_mock.assert_called_once()
+        args = deactivation_mock.call_args[0]
+
+        # Check that the mock was called with the right user ID
+        self.assertEqual(args[0], user_id)
+
+        # Check that the mock was made by an admin
+        self.assertEqual(args[1], True)
+
+    def test_check_can_shutdown_room(self) -> None:
+        """Tests that the check_can_shutdown_room module callback is called
+        correctly when processing an admin's shutdown room request.
+        """
+        # Register a mocked callback.
+        shutdown_mock = Mock(return_value=make_awaitable(False))
+        third_party_rules = self.hs.get_third_party_event_rules()
+        third_party_rules._check_can_shutdown_room_callbacks.append(
+            shutdown_mock,
+        )
+
+        # Register an admin user.
+        admin_user_id = self.register_user("admin", "password", admin=True)
+        admin_tok = self.login("admin", "password")
+
+        # Shutdown the room.
+        channel = self.make_request(
+            "DELETE",
+            "/_synapse/admin/v2/rooms/%s" % self.room_id,
+            {},
+            access_token=admin_tok,
+        )
+
+        # Check that the shutdown was blocked
+        self.assertEqual(channel.code, 403, channel.json_body)
+
+        # Check that the mock was called once.
+        shutdown_mock.assert_called_once()
+        args = shutdown_mock.call_args[0]
+
+        # Check that the mock was called with the right user ID
+        self.assertEqual(args[0], admin_user_id)
+
+        # Check that the mock was called with the right room ID
+        self.assertEqual(args[1], self.room_id)
+
+    def test_on_threepid_bind(self) -> None:
+        """Tests that the on_threepid_bind module callback is called correctly after
+        associating a 3PID to an account.
+        """
+        # Register a mocked callback.
+        threepid_bind_mock = Mock(return_value=make_awaitable(None))
+        third_party_rules = self.hs.get_third_party_event_rules()
+        third_party_rules._on_threepid_bind_callbacks.append(threepid_bind_mock)
+
+        # Register an admin user.
+        self.register_user("admin", "password", admin=True)
+        admin_tok = self.login("admin", "password")
+
+        # Also register a normal user we can modify.
+        user_id = self.register_user("user", "password")
+
+        # Add a 3PID to the user.
+        channel = self.make_request(
+            "PUT",
+            "/_synapse/admin/v2/users/%s" % user_id,
+            {
+                "threepids": [
+                    {
+                        "medium": "email",
+                        "address": "foo@example.com",
+                    },
+                ],
+            },
+            access_token=admin_tok,
+        )
+
+        # Check that the shutdown was blocked
+        self.assertEqual(channel.code, 200, channel.json_body)
+
+        # Check that the mock was called once.
+        threepid_bind_mock.assert_called_once()
+        args = threepid_bind_mock.call_args[0]
+
+        # Check that the mock was called with the right parameters
+        self.assertEqual(args, (user_id, "email", "foo@example.com"))

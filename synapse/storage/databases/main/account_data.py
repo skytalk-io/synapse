@@ -14,10 +14,19 @@
 # limitations under the License.
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, Tuple, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    FrozenSet,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    cast,
+)
 
 from synapse.api.constants import AccountDataTypes
-from synapse.replication.slave.storage._slaved_id_tracker import SlavedIdTracker
 from synapse.replication.tcp.streams import AccountDataStream, TagAccountDataStream
 from synapse.storage._base import db_to_json
 from synapse.storage.database import (
@@ -58,12 +67,11 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
         # to write account data. A value of `True` implies that `_account_data_id_gen`
         # is an `AbstractStreamIdGenerator` and not just a tracker.
         self._account_data_id_gen: AbstractStreamIdTracker
+        self._can_write_to_account_data = (
+            self._instance_name in hs.config.worker.writers.account_data
+        )
 
         if isinstance(database.engine, PostgresEngine):
-            self._can_write_to_account_data = (
-                self._instance_name in hs.config.worker.writers.account_data
-            )
-
             self._account_data_id_gen = MultiWriterIdGenerator(
                 db_conn=db_conn,
                 db=database,
@@ -85,21 +93,13 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
             # `StreamIdGenerator`, otherwise we use `SlavedIdTracker` which gets
             # updated over replication. (Multiple writers are not supported for
             # SQLite).
-            if self._instance_name in hs.config.worker.writers.account_data:
-                self._can_write_to_account_data = True
-                self._account_data_id_gen = StreamIdGenerator(
-                    db_conn,
-                    "room_account_data",
-                    "stream_id",
-                    extra_tables=[("room_tags_revisions", "stream_id")],
-                )
-            else:
-                self._account_data_id_gen = SlavedIdTracker(
-                    db_conn,
-                    "room_account_data",
-                    "stream_id",
-                    extra_tables=[("room_tags_revisions", "stream_id")],
-                )
+            self._account_data_id_gen = StreamIdGenerator(
+                db_conn,
+                "room_account_data",
+                "stream_id",
+                extra_tables=[("room_tags_revisions", "stream_id")],
+                is_writer=self._instance_name in hs.config.worker.writers.account_data,
+            )
 
         account_max = self.get_max_account_data_stream_id()
         self._account_data_stream_cache = StreamChangeCache(
@@ -365,7 +365,7 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
         )
 
     @cached(max_entries=5000, iterable=True)
-    async def ignored_by(self, user_id: str) -> Set[str]:
+    async def ignored_by(self, user_id: str) -> FrozenSet[str]:
         """
         Get users which ignore the given user.
 
@@ -375,12 +375,32 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
         Return:
             The user IDs which ignore the given user.
         """
-        return set(
+        return frozenset(
             await self.db_pool.simple_select_onecol(
                 table="ignored_users",
                 keyvalues={"ignored_user_id": user_id},
                 retcol="ignorer_user_id",
                 desc="ignored_by",
+            )
+        )
+
+    @cached(max_entries=5000, iterable=True)
+    async def ignored_users(self, user_id: str) -> FrozenSet[str]:
+        """
+        Get users which the given user ignores.
+
+        Params:
+            user_id: The user ID which is making the request.
+
+        Return:
+            The user IDs which are ignored by the given user.
+        """
+        return frozenset(
+            await self.db_pool.simple_select_onecol(
+                table="ignored_users",
+                keyvalues={"ignorer_user_id": user_id},
+                retcol="ignored_user_id",
+                desc="ignored_users",
             )
         )
 
@@ -429,9 +449,6 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
         content_json = json_encoder.encode(content)
 
         async with self._account_data_id_gen.get_next() as next_id:
-            # no need to lock here as room_account_data has a unique constraint
-            # on (user_id, room_id, account_data_type) so simple_upsert will
-            # retry if there is a conflict.
             await self.db_pool.simple_upsert(
                 desc="add_room_account_data",
                 table="room_account_data",
@@ -441,7 +458,6 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
                     "account_data_type": account_data_type,
                 },
                 values={"stream_id": next_id, "content": content_json},
-                lock=False,
             )
 
             self._account_data_stream_cache.entity_has_changed(user_id, next_id)
@@ -497,15 +513,11 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
     ) -> None:
         content_json = json_encoder.encode(content)
 
-        # no need to lock here as account_data has a unique constraint on
-        # (user_id, account_data_type) so simple_upsert will retry if
-        # there is a conflict.
         self.db_pool.simple_upsert_txn(
             txn,
             table="account_data",
             keyvalues={"user_id": user_id, "account_data_type": account_data_type},
             values={"stream_id": next_id, "content": content_json},
-            lock=False,
         )
 
         # Ignored users get denormalized into a separate table as an optimisation.
@@ -529,6 +541,10 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
         else:
             currently_ignored_users = set()
 
+        # If the data has not changed, nothing to do.
+        if previously_ignored_users == currently_ignored_users:
+            return
+
         # Delete entries which are no longer ignored.
         self.db_pool.simple_delete_many_txn(
             txn,
@@ -551,6 +567,7 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
         # Invalidate the cache for any ignored users which were added or removed.
         for ignored_user_id in previously_ignored_users ^ currently_ignored_users:
             self._invalidate_cache_and_stream(txn, self.ignored_by, (ignored_user_id,))
+        self._invalidate_cache_and_stream(txn, self.ignored_users, (user_id,))
 
     async def purge_account_data_for_user(self, user_id: str) -> None:
         """
@@ -615,9 +632,6 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
             txn, self.get_account_data_for_room, (user_id,)
         )
         self._invalidate_cache_and_stream(txn, self.get_push_rules_for_user, (user_id,))
-        self._invalidate_cache_and_stream(
-            txn, self.get_push_rules_enabled_for_user, (user_id,)
-        )
         # This user might be contained in the ignored_by cache for other users,
         # so we have to invalidate it all.
         self._invalidate_all_cache_and_stream(txn, self.ignored_by)

@@ -14,25 +14,18 @@
 import logging
 from unittest.mock import patch
 
-from synapse.api.room_versions import RoomVersion
 from synapse.rest import admin
 from synapse.rest.client import login, room, sync
 from synapse.storage.util.id_generators import MultiWriterIdGenerator
 
 from tests.replication._base import BaseMultiWorkerStreamTestCase
 from tests.server import make_request
-from tests.utils import USE_POSTGRES_FOR_TESTS
 
 logger = logging.getLogger(__name__)
 
 
 class EventPersisterShardTestCase(BaseMultiWorkerStreamTestCase):
     """Checks event persisting sharding works"""
-
-    # Event persister sharding requires postgres (due to needing
-    # `MultiWriterIdGenerator`).
-    if not USE_POSTGRES_FOR_TESTS:
-        skip = "Requires Postgres"
 
     servlets = [
         admin.register_servlets_for_client_rest_resource,
@@ -51,7 +44,6 @@ class EventPersisterShardTestCase(BaseMultiWorkerStreamTestCase):
 
     def default_config(self):
         conf = super().default_config()
-        conf["redis"] = {"enabled": "true"}
         conf["stream_writers"] = {"events": ["worker1", "worker2"]}
         conf["instance_map"] = {
             "worker1": {"host": "testserv", "port": 1001},
@@ -64,21 +56,10 @@ class EventPersisterShardTestCase(BaseMultiWorkerStreamTestCase):
 
         # We control the room ID generation by patching out the
         # `_generate_room_id` method
-        async def generate_room(
-            creator_id: str, is_public: bool, room_version: RoomVersion
-        ):
-            await self.store.store_room(
-                room_id=room_id,
-                room_creator_user_id=creator_id,
-                is_public=is_public,
-                room_version=room_version,
-            )
-            return room_id
-
         with patch(
             "synapse.handlers.room.RoomCreationHandler._generate_room_id"
         ) as mock:
-            mock.side_effect = generate_room
+            mock.side_effect = lambda: room_id
             self.helper.create_room_as(user_id, tok=tok)
 
     def test_basic(self):

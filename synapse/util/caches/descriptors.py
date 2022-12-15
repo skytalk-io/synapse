@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import enum
 import functools
 import inspect
 import logging
@@ -20,10 +19,12 @@ from typing import (
     Any,
     Awaitable,
     Callable,
+    Collection,
     Dict,
     Generic,
     Hashable,
     Iterable,
+    List,
     Mapping,
     Optional,
     Sequence,
@@ -40,6 +41,7 @@ from twisted.python.failure import Failure
 
 from synapse.logging.context import make_deferred_yieldable, preserve_fn
 from synapse.util import unwrapFirstError
+from synapse.util.async_helpers import delay_cancellation
 from synapse.util.caches.deferred_cache import DeferredCache
 from synapse.util.caches.lrucache import LruCache
 
@@ -50,7 +52,7 @@ CacheKey = Union[Tuple, Any]
 F = TypeVar("F", bound=Callable[..., Any])
 
 
-class _CachedFunction(Generic[F]):
+class CachedFunction(Generic[F]):
     invalidate: Any = None
     invalidate_all: Any = None
     prefill: Any = None
@@ -69,12 +71,22 @@ class _CacheDescriptorBase:
         self,
         orig: Callable[..., Any],
         num_args: Optional[int],
+        uncached_args: Optional[Collection[str]] = None,
         cache_context: bool = False,
+        name: Optional[str] = None,
     ):
         self.orig = orig
+        self.name = name or orig.__name__
 
         arg_spec = inspect.getfullargspec(orig)
         all_args = arg_spec.args
+
+        # There's no reason that keyword-only arguments couldn't be supported,
+        # but right now they're buggy so do not allow them.
+        if arg_spec.kwonlyargs:
+            raise ValueError(
+                "_CacheDescriptorBase does not support keyword-only arguments."
+            )
 
         if "cache_context" in all_args:
             if not cache_context:
@@ -87,6 +99,9 @@ class _CacheDescriptorBase:
                 "Cannot have cache_context=True without having an arg"
                 " named `cache_context`"
             )
+
+        if num_args is not None and uncached_args is not None:
+            raise ValueError("Cannot provide both num_args and uncached_args")
 
         if num_args is None:
             num_args = len(all_args) - 1
@@ -105,6 +120,12 @@ class _CacheDescriptorBase:
         # list of the names of the args used as the cache key
         self.arg_names = all_args[1 : num_args + 1]
 
+        # If there are args to not cache on, filter them out (and fix the size of num_args).
+        if uncached_args is not None:
+            include_arg_in_cache_key = [n not in uncached_args for n in self.arg_names]
+        else:
+            include_arg_in_cache_key = [True] * len(self.arg_names)
+
         # self.arg_defaults is a map of arg name to its default value for each
         # argument that has a default value
         if arg_spec.defaults:
@@ -119,111 +140,9 @@ class _CacheDescriptorBase:
 
         self.add_cache_context = cache_context
 
-        self.cache_key_builder = get_cache_key_builder(
-            self.arg_names, self.arg_defaults
+        self.cache_key_builder = _get_cache_key_builder(
+            self.arg_names, include_arg_in_cache_key, self.arg_defaults
         )
-
-
-class _LruCachedFunction(Generic[F]):
-    cache: LruCache[CacheKey, Any]
-    __call__: F
-
-
-def lru_cache(
-    max_entries: int = 1000,
-    cache_context: bool = False,
-) -> Callable[[F], _LruCachedFunction[F]]:
-    """A method decorator that applies a memoizing cache around the function.
-
-    This is more-or-less a drop-in equivalent to functools.lru_cache, although note
-    that the signature is slightly different.
-
-    The main differences with functools.lru_cache are:
-        (a) the size of the cache can be controlled via the cache_factor mechanism
-        (b) the wrapped function can request a "cache_context" which provides a
-            callback mechanism to indicate that the result is no longer valid
-        (c) prometheus metrics are exposed automatically.
-
-    The function should take zero or more arguments, which are used as the key for the
-    cache. Single-argument functions use that argument as the cache key; otherwise the
-    arguments are built into a tuple.
-
-    Cached functions can be "chained" (i.e. a cached function can call other cached
-    functions and get appropriately invalidated when they called caches are
-    invalidated) by adding a special "cache_context" argument to the function
-    and passing that as a kwarg to all caches called. For example:
-
-        @lru_cache(cache_context=True)
-        def foo(self, key, cache_context):
-            r1 = self.bar1(key, on_invalidate=cache_context.invalidate)
-            r2 = self.bar2(key, on_invalidate=cache_context.invalidate)
-            return r1 + r2
-
-    The wrapped function also has a 'cache' property which offers direct access to the
-    underlying LruCache.
-    """
-
-    def func(orig: F) -> _LruCachedFunction[F]:
-        desc = LruCacheDescriptor(
-            orig,
-            max_entries=max_entries,
-            cache_context=cache_context,
-        )
-        return cast(_LruCachedFunction[F], desc)
-
-    return func
-
-
-class LruCacheDescriptor(_CacheDescriptorBase):
-    """Helper for @lru_cache"""
-
-    class _Sentinel(enum.Enum):
-        sentinel = object()
-
-    def __init__(
-        self,
-        orig: Callable[..., Any],
-        max_entries: int = 1000,
-        cache_context: bool = False,
-    ):
-        super().__init__(orig, num_args=None, cache_context=cache_context)
-        self.max_entries = max_entries
-
-    def __get__(self, obj: Optional[Any], owner: Optional[Type]) -> Callable[..., Any]:
-        cache: LruCache[CacheKey, Any] = LruCache(
-            cache_name=self.orig.__name__,
-            max_size=self.max_entries,
-        )
-
-        get_cache_key = self.cache_key_builder
-        sentinel = LruCacheDescriptor._Sentinel.sentinel
-
-        @functools.wraps(self.orig)
-        def _wrapped(*args: Any, **kwargs: Any) -> Any:
-            invalidate_callback = kwargs.pop("on_invalidate", None)
-            callbacks = (invalidate_callback,) if invalidate_callback else ()
-
-            cache_key = get_cache_key(args, kwargs)
-
-            ret = cache.get(cache_key, default=sentinel, callbacks=callbacks)
-            if ret != sentinel:
-                return ret
-
-            # Add our own `cache_context` to argument list if the wrapped function
-            # has asked for one
-            if self.add_cache_context:
-                kwargs["cache_context"] = _CacheContext.get_instance(cache, cache_key)
-
-            ret2 = self.orig(obj, *args, **kwargs)
-            cache.set(cache_key, ret2, callbacks=callbacks)
-
-            return ret2
-
-        wrapped = cast(_CachedFunction, _wrapped)
-        wrapped.cache = cache
-        obj.__dict__[self.orig.__name__] = wrapped
-
-        return wrapped
 
 
 class DeferredCacheDescriptor(_CacheDescriptorBase):
@@ -260,6 +179,9 @@ class DeferredCacheDescriptor(_CacheDescriptorBase):
         num_args: number of positional arguments (excluding ``self`` and
             ``cache_context``) to use as cache keys. Defaults to all named
             args of the function.
+        uncached_args: a list of argument names to not use as the cache key.
+            (``self`` and ``cache_context`` are always ignored.) Cannot be used
+            with num_args.
         tree:
         cache_context:
         iterable:
@@ -273,12 +195,20 @@ class DeferredCacheDescriptor(_CacheDescriptorBase):
         orig: Callable[..., Any],
         max_entries: int = 1000,
         num_args: Optional[int] = None,
+        uncached_args: Optional[Collection[str]] = None,
         tree: bool = False,
         cache_context: bool = False,
         iterable: bool = False,
         prune_unread_entries: bool = True,
+        name: Optional[str] = None,
     ):
-        super().__init__(orig, num_args=num_args, cache_context=cache_context)
+        super().__init__(
+            orig,
+            num_args=num_args,
+            uncached_args=uncached_args,
+            cache_context=cache_context,
+            name=name,
+        )
 
         if tree and self.num_args < 2:
             raise RuntimeError(
@@ -292,7 +222,7 @@ class DeferredCacheDescriptor(_CacheDescriptorBase):
 
     def __get__(self, obj: Optional[Any], owner: Optional[Type]) -> Callable[..., Any]:
         cache: DeferredCache[CacheKey, Any] = DeferredCache(
-            name=self.orig.__name__,
+            name=self.name,
             max_entries=self.max_entries,
             tree=self.tree,
             iterable=self.iterable,
@@ -322,9 +252,14 @@ class DeferredCacheDescriptor(_CacheDescriptorBase):
                 ret = defer.maybeDeferred(preserve_fn(self.orig), obj, *args, **kwargs)
                 ret = cache.set(cache_key, ret, callback=invalidate_callback)
 
+                # We started a new call to `self.orig`, so we must always wait for it to
+                # complete. Otherwise we might mark our current logging context as
+                # finished while `self.orig` is still using it in the background.
+                ret = delay_cancellation(ret)
+
             return make_deferred_yieldable(ret)
 
-        wrapped = cast(_CachedFunction, _wrapped)
+        wrapped = cast(CachedFunction, _wrapped)
 
         if self.num_args == 1:
             assert not self.tree
@@ -338,7 +273,7 @@ class DeferredCacheDescriptor(_CacheDescriptorBase):
         wrapped.cache = cache
         wrapped.num_args = self.num_args
 
-        obj.__dict__[self.orig.__name__] = wrapped
+        obj.__dict__[self.name] = wrapped
 
         return wrapped
 
@@ -359,6 +294,7 @@ class DeferredCacheListDescriptor(_CacheDescriptorBase):
         cached_method_name: str,
         list_name: str,
         num_args: Optional[int] = None,
+        name: Optional[str] = None,
     ):
         """
         Args:
@@ -369,7 +305,7 @@ class DeferredCacheListDescriptor(_CacheDescriptorBase):
                 but including list_name) to use as cache keys. Defaults to all
                 named args of the function.
         """
-        super().__init__(orig, num_args=num_args)
+        super().__init__(orig, num_args=num_args, uncached_args=None, name=name)
 
         self.list_name = list_name
 
@@ -391,6 +327,12 @@ class DeferredCacheListDescriptor(_CacheDescriptorBase):
         cache: DeferredCache[CacheKey, Any] = cached_method.cache
         num_args = cached_method.num_args
 
+        if num_args != self.num_args:
+            raise TypeError(
+                "Number of args (%s) does not match underlying cache_method_name=%s (%s)."
+                % (self.num_args, self.cached_method_name, num_args)
+            )
+
         @functools.wraps(self.orig)
         def wrapped(*args: Any, **kwargs: Any) -> "defer.Deferred[Dict]":
             # If we're passed a cache_context then we'll want to call its
@@ -401,22 +343,15 @@ class DeferredCacheListDescriptor(_CacheDescriptorBase):
             keyargs = [arg_dict[arg_nm] for arg_nm in self.arg_names]
             list_args = arg_dict[self.list_name]
 
-            results = {}
-
-            def update_results_dict(res: Any, arg: Hashable) -> None:
-                results[arg] = res
-
-            # list of deferreds to wait for
-            cached_defers = []
-
-            missing = set()
-
             # If the cache takes a single arg then that is used as the key,
             # otherwise a tuple is used.
             if num_args == 1:
 
                 def arg_to_cache_key(arg: Hashable) -> Hashable:
                     return arg
+
+                def cache_key_to_arg(key: tuple) -> Hashable:
+                    return key
 
             else:
                 keylist = list(keyargs)
@@ -425,68 +360,68 @@ class DeferredCacheListDescriptor(_CacheDescriptorBase):
                     keylist[self.list_pos] = arg
                     return tuple(keylist)
 
-            for arg in list_args:
-                try:
-                    res = cache.get(arg_to_cache_key(arg), callback=invalidate_callback)
-                    if not res.called:
-                        res.addCallback(update_results_dict, arg)
-                        cached_defers.append(res)
-                    else:
-                        results[arg] = res.result
-                except KeyError:
-                    missing.add(arg)
+                def cache_key_to_arg(key: tuple) -> Hashable:
+                    return key[self.list_pos]
+
+            cache_keys = [arg_to_cache_key(arg) for arg in list_args]
+            immediate_results, pending_deferred, missing = cache.get_bulk(
+                cache_keys, callback=invalidate_callback
+            )
+
+            results = {cache_key_to_arg(key): v for key, v in immediate_results.items()}
+
+            cached_defers: List["defer.Deferred[Any]"] = []
+            if pending_deferred:
+
+                def update_results(r: Dict) -> None:
+                    for k, v in r.items():
+                        results[cache_key_to_arg(k)] = v
+
+                pending_deferred.addCallback(update_results)
+                cached_defers.append(pending_deferred)
 
             if missing:
-                # we need a deferred for each entry in the list,
-                # which we put in the cache. Each deferred resolves with the
-                # relevant result for that key.
-                deferreds_map = {}
-                for arg in missing:
-                    deferred: "defer.Deferred[Any]" = defer.Deferred()
-                    deferreds_map[arg] = deferred
-                    key = arg_to_cache_key(arg)
-                    cached_defers.append(
-                        cache.set(key, deferred, callback=invalidate_callback)
-                    )
+                cache_entry = cache.start_bulk_input(missing, invalidate_callback)
 
                 def complete_all(res: Dict[Hashable, Any]) -> None:
-                    # the wrapped function has completed. It returns a dict.
-                    # We can now update our own result map, and then resolve the
-                    # observable deferreds in the cache.
-                    for e, d1 in deferreds_map.items():
-                        val = res.get(e, None)
-                        # make sure we update the results map before running the
-                        # deferreds, because as soon as we run the last deferred, the
-                        # gatherResults() below will complete and return the result
-                        # dict to our caller.
-                        results[e] = val
-                        d1.callback(val)
+                    missing_results = {}
+                    for key in missing:
+                        arg = cache_key_to_arg(key)
+                        val = res.get(arg, None)
+
+                        results[arg] = val
+                        missing_results[key] = val
+
+                    cache_entry.complete_bulk(cache, missing_results)
 
                 def errback_all(f: Failure) -> None:
-                    # the wrapped function has failed. Propagate the failure into
-                    # the cache, which will invalidate the entry, and cause the
-                    # relevant cached_deferreds to fail, which will propagate the
-                    # failure to our caller.
-                    for d1 in deferreds_map.values():
-                        d1.errback(f)
+                    cache_entry.error_bulk(cache, missing, f)
 
                 args_to_call = dict(arg_dict)
-                args_to_call[self.list_name] = missing
+                args_to_call[self.list_name] = {
+                    cache_key_to_arg(key) for key in missing
+                }
 
                 # dispatch the call, and attach the two handlers
-                defer.maybeDeferred(
+                missing_d = defer.maybeDeferred(
                     preserve_fn(self.orig), **args_to_call
                 ).addCallbacks(complete_all, errback_all)
+                cached_defers.append(missing_d)
 
             if cached_defers:
                 d = defer.gatherResults(cached_defers, consumeErrors=True).addCallbacks(
                     lambda _: results, unwrapFirstError
                 )
+                if missing:
+                    # We started a new call to `self.orig`, so we must always wait for it to
+                    # complete. Otherwise we might mark our current logging context as
+                    # finished while `self.orig` is still using it in the background.
+                    d = delay_cancellation(d)
                 return make_deferred_yieldable(d)
             else:
                 return defer.succeed(results)
 
-        obj.__dict__[self.orig.__name__] = wrapped
+        obj.__dict__[self.name] = wrapped
 
         return wrapped
 
@@ -530,36 +465,46 @@ class _CacheContext:
 
 
 def cached(
+    *,
     max_entries: int = 1000,
     num_args: Optional[int] = None,
+    uncached_args: Optional[Collection[str]] = None,
     tree: bool = False,
     cache_context: bool = False,
     iterable: bool = False,
     prune_unread_entries: bool = True,
-) -> Callable[[F], _CachedFunction[F]]:
+    name: Optional[str] = None,
+) -> Callable[[F], CachedFunction[F]]:
     func = lambda orig: DeferredCacheDescriptor(
         orig,
         max_entries=max_entries,
         num_args=num_args,
+        uncached_args=uncached_args,
         tree=tree,
         cache_context=cache_context,
         iterable=iterable,
         prune_unread_entries=prune_unread_entries,
+        name=name,
     )
 
-    return cast(Callable[[F], _CachedFunction[F]], func)
+    return cast(Callable[[F], CachedFunction[F]], func)
 
 
 def cachedList(
-    cached_method_name: str, list_name: str, num_args: Optional[int] = None
-) -> Callable[[F], _CachedFunction[F]]:
-    """Creates a descriptor that wraps a function in a `CacheListDescriptor`.
+    *,
+    cached_method_name: str,
+    list_name: str,
+    num_args: Optional[int] = None,
+    name: Optional[str] = None,
+) -> Callable[[F], CachedFunction[F]]:
+    """Creates a descriptor that wraps a function in a `DeferredCacheListDescriptor`.
 
-    Used to do batch lookups for an already created cache. A single argument
+    Used to do batch lookups for an already created cache. One of the arguments
     is specified as a list that is iterated through to lookup keys in the
     original cache. A new tuple consisting of the (deduplicated) keys that weren't in
-    the cache gets passed to the original function, the result of which is stored in the
-    cache.
+    the cache gets passed to the original function, which is expected to results
+    in a map of key to value for each passed value. The new results are stored in the
+    original cache. Note that any missing values are cached as None.
 
     Args:
         cached_method_name: The name of the single-item lookup method.
@@ -572,11 +517,11 @@ def cachedList(
     Example:
 
         class Example:
-            @cached(num_args=2)
-            def do_something(self, first_arg):
+            @cached()
+            def do_something(self, first_arg, second_arg):
                 ...
 
-            @cachedList(do_something.cache, list_name="second_args", num_args=2)
+            @cachedList(cached_method_name="do_something", list_name="second_args")
             def batch_do_something(self, first_arg, second_args):
                 ...
     """
@@ -585,18 +530,22 @@ def cachedList(
         cached_method_name=cached_method_name,
         list_name=list_name,
         num_args=num_args,
+        name=name,
     )
 
-    return cast(Callable[[F], _CachedFunction[F]], func)
+    return cast(Callable[[F], CachedFunction[F]], func)
 
 
-def get_cache_key_builder(
-    param_names: Sequence[str], param_defaults: Mapping[str, Any]
+def _get_cache_key_builder(
+    param_names: Sequence[str],
+    include_params: Sequence[bool],
+    param_defaults: Mapping[str, Any],
 ) -> Callable[[Sequence[Any], Mapping[str, Any]], CacheKey]:
     """Construct a function which will build cache keys suitable for a cached function
 
     Args:
         param_names: list of formal parameter names for the cached function
+        include_params: list of bools of whether to include the parameter name in the cache key
         param_defaults: a mapping from parameter name to default value for that param
 
     Returns:
@@ -608,6 +557,7 @@ def get_cache_key_builder(
 
     if len(param_names) == 1:
         nm = param_names[0]
+        assert include_params[0] is True
 
         def get_cache_key(args: Sequence[Any], kwargs: Mapping[str, Any]) -> CacheKey:
             if nm in kwargs:
@@ -620,13 +570,18 @@ def get_cache_key_builder(
     else:
 
         def get_cache_key(args: Sequence[Any], kwargs: Mapping[str, Any]) -> CacheKey:
-            return tuple(_get_cache_key_gen(param_names, param_defaults, args, kwargs))
+            return tuple(
+                _get_cache_key_gen(
+                    param_names, include_params, param_defaults, args, kwargs
+                )
+            )
 
     return get_cache_key
 
 
 def _get_cache_key_gen(
     param_names: Iterable[str],
+    include_params: Iterable[bool],
     param_defaults: Mapping[str, Any],
     args: Sequence[Any],
     kwargs: Mapping[str, Any],
@@ -637,16 +592,18 @@ def _get_cache_key_gen(
     This is essentially the same operation as `inspect.getcallargs`, but optimised so
     that we don't need to inspect the target function for each call.
     """
-
     # We loop through each arg name, looking up if its in the `kwargs`,
     # otherwise using the next argument in `args`. If there are no more
     # args then we try looking the arg name up in the defaults.
     pos = 0
-    for nm in param_names:
+    for nm, inc in zip(param_names, include_params):
         if nm in kwargs:
-            yield kwargs[nm]
+            if inc:
+                yield kwargs[nm]
         elif pos < len(args):
-            yield args[pos]
+            if inc:
+                yield args[pos]
             pos += 1
         else:
-            yield param_defaults[nm]
+            if inc:
+                yield param_defaults[nm]

@@ -81,17 +81,13 @@ class MessageAcceptTests(unittest.HomeserverTestCase):
         self.handler = self.homeserver.get_federation_handler()
         federation_event_handler = self.homeserver.get_federation_event_handler()
 
-        async def _check_event_auth(
-            origin,
-            event,
-            context,
-        ):
-            return context
+        async def _check_event_auth(origin, event, context):
+            pass
 
         federation_event_handler._check_event_auth = _check_event_auth
         self.client = self.homeserver.get_federation_client()
-        self.client._check_sigs_and_hash_and_fetch = lambda dest, pdus, **k: succeed(
-            pdus
+        self.client._check_sigs_and_hash_for_pulled_events_and_fetch = (
+            lambda dest, pdus, **k: succeed(pdus)
         )
 
         # Send the join, it should return None (which is not an error)
@@ -233,7 +229,7 @@ class MessageAcceptTests(unittest.HomeserverTestCase):
         # Register mock device list retrieval on the federation client.
         federation_client = self.homeserver.get_federation_client()
         federation_client.query_user_devices = Mock(
-            return_value=succeed(
+            return_value=make_awaitable(
                 {
                     "user_id": remote_user_id,
                     "stream_id": 1,

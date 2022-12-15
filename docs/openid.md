@@ -45,9 +45,16 @@ as follows:
    maintainer.
 
 To enable the OpenID integration, you should then add a section to the `oidc_providers`
-setting in your configuration file (or uncomment one of the existing examples).
-See [sample_config.yaml](./sample_config.yaml) for some sample settings, as well as
+setting in your configuration file.
+See the [configuration manual](usage/configuration/config_documentation.md#oidc_providers) for some sample settings, as well as
 the text below for example configurations for specific providers.
+
+## OIDC Back-Channel Logout
+
+Synapse supports receiving [OpenID Connect Back-Channel Logout](https://openid.net/specs/openid-connect-backchannel-1_0.html) notifications.
+
+This lets the OpenID Connect Provider notify Synapse when a user logs out, so that Synapse can end that user session.
+This feature can be enabled by setting the `backchannel_logout_enabled` property to `true` in the provider configuration, and setting the following URL as destination for Back-Channel Logout notifications in your OpenID Connect Provider: `[synapse public baseurl]/_synapse/client/oidc/backchannel_logout`
 
 ## Sample configs
 
@@ -123,6 +130,9 @@ oidc_providers:
 
 [Keycloak][keycloak-idp] is an opensource IdP maintained by Red Hat.
 
+Keycloak supports OIDC Back-Channel Logout, which sends logout notification to Synapse, so that Synapse users get logged out when they log out from Keycloak.
+This can be optionally enabled by setting `backchannel_logout_enabled` to `true` in the Synapse configuration, and by setting the "Backchannel Logout URL" in Keycloak.
+
 Follow the [Getting Started Guide](https://www.keycloak.org/getting-started) to install Keycloak and set up a realm.
 
 1. Click `Clients` in the sidebar and click `Create`
@@ -144,6 +154,8 @@ Follow the [Getting Started Guide](https://www.keycloak.org/getting-started) to 
 | Client Protocol | `openid-connect` |
 | Access Type | `confidential` |
 | Valid Redirect URIs | `[synapse public baseurl]/_synapse/client/oidc/callback` |
+| Backchannel Logout URL (optional) | `[synapse public baseurl]/_synapse/client/oidc/backchannel_logout` |
+| Backchannel Logout Session Required (optional) | `On` |
 
 5. Click `Save`
 6. On the Credentials tab, update the fields:
@@ -159,7 +171,7 @@ Follow the [Getting Started Guide](https://www.keycloak.org/getting-started) to 
 oidc_providers:
   - idp_id: keycloak
     idp_name: "My KeyCloak server"
-    issuer: "https://127.0.0.1:8443/auth/realms/{realm_name}"
+    issuer: "https://127.0.0.1:8443/realms/{realm_name}"
     client_id: "synapse"
     client_secret: "copy secret generated from above"
     scopes: ["openid", "profile"]
@@ -167,14 +179,18 @@ oidc_providers:
       config:
         localpart_template: "{{ user.preferred_username }}"
         display_name_template: "{{ user.name }}"
+    backchannel_logout_enabled: true # Optional
 ```
+
 ### Auth0
 
 [Auth0][auth0] is a hosted SaaS IdP solution.
 
 1. Create a regular web application for Synapse
 2. Set the Allowed Callback URLs to `[synapse public baseurl]/_synapse/client/oidc/callback`
-3. Add a rule to add the `preferred_username` claim.
+3. Add a rule with any name to add the `preferred_username` claim. 
+(See https://auth0.com/docs/customize/rules/create-rules for more information on how to create rules.)
+   
    <details>
     <summary>Code sample</summary>
 
@@ -225,6 +241,8 @@ oidc_providers:
 3. Create an application for synapse in Authentik and link it to the provider.
 4. Note the slug of your application, Client ID and Client Secret.
 
+Note: RSA keys must be used for signing for Authentik, ECC keys do not work.
+
 Synapse config:
 ```yaml
 oidc_providers:
@@ -240,7 +258,7 @@ oidc_providers:
       - "email"
     user_mapping_provider:
       config:
-        localpart_template: "{{ user.preferred_username }}}"
+        localpart_template: "{{ user.preferred_username }}"
         display_name_template: "{{ user.preferred_username|capitalize }}" # TO BE FILLED: If your users have names in Authentik and you want those in Synapse, this should be replaced with user.name|capitalize.
 ```
 
@@ -291,7 +309,7 @@ can be used to retrieve information on the authenticated user. As the Synapse
 login mechanism needs an attribute to uniquely identify users, and that endpoint
 does not return a `sub` property, an alternative `subject_claim` has to be set.
 
-1. Create a new OAuth application: https://github.com/settings/applications/new.
+1. Create a new OAuth application: [https://github.com/settings/applications/new](https://github.com/settings/applications/new).
 2. Set the callback URL to `[synapse public baseurl]/_synapse/client/oidc/callback`.
 
 Synapse config:
@@ -320,10 +338,10 @@ oidc_providers:
 
 [Google][google-idp] is an OpenID certified authentication and authorisation provider.
 
-1. Set up a project in the Google API Console (see
-   https://developers.google.com/identity/protocols/oauth2/openid-connect#appsetup).
-2. Add an "OAuth Client ID" for a Web Application under "Credentials".
-3. Copy the Client ID and Client Secret, and add the following to your synapse config:
+1. Set up a project in the Google API Console (see 
+   [documentation](https://developers.google.com/identity/protocols/oauth2/openid-connect#appsetup)).
+3. Add an "OAuth Client ID" for a Web Application under "Credentials".
+4. Copy the Client ID and Client Secret, and add the following to your synapse config:
    ```yaml
    oidc_providers:
      - idp_id: google
@@ -332,11 +350,12 @@ oidc_providers:
        issuer: "https://accounts.google.com/"
        client_id: "your-client-id" # TO BE FILLED
        client_secret: "your-client-secret" # TO BE FILLED
-       scopes: ["openid", "profile"]
+       scopes: ["openid", "profile", "email"] # email is optional, read below
        user_mapping_provider:
          config:
            localpart_template: "{{ user.given_name|lower }}"
            display_name_template: "{{ user.name }}"
+           email_template: "{{ user.email }}" # needs "email" in scopes above
    ```
 4. Back in the Google console, add this Authorized redirect URI: `[synapse
    public baseurl]/_synapse/client/oidc/callback`.
@@ -419,7 +438,7 @@ Synapse config:
     user_mapping_provider:
       config:
         display_name_template: "{{ user.name }}"
-        email_template: "{{ '{{ user.email }}' }}"
+        email_template: "{{ user.email }}"
 ```
 
 Relevant documents:
@@ -499,8 +518,8 @@ As well as the private key file, you will need:
  * Team ID: a 10-character ID associated with your developer account.
  * Key ID: the 10-character identifier for the key.
 
-https://help.apple.com/developer-account/?lang=en#/dev77c875b7e has more
-documentation on setting up SiWA.
+[Apple's developer documentation](https://help.apple.com/developer-account/?lang=en#/dev77c875b7e)
+has more information on setting up SiWA.
 
 The synapse config will look like this:
 
@@ -533,8 +552,8 @@ needed to add OAuth2 capabilities to your Django projects. It supports
 
 Configuration on Django's side:
 
-1. Add an application: https://example.com/admin/oauth2_provider/application/add/ and choose parameters like this:
-* `Redirect uris`: https://synapse.example.com/_synapse/client/oidc/callback
+1. Add an application: `https://example.com/admin/oauth2_provider/application/add/` and choose parameters like this:
+* `Redirect uris`: `https://synapse.example.com/_synapse/client/oidc/callback`
 * `Client type`: `Confidential`
 * `Authorization grant type`: `Authorization code`
 * `Algorithm`: `HMAC with SHA-2 256`
@@ -571,3 +590,44 @@ oidc_providers:
         display_name_template: "{{ user.first_name }} {{ user.last_name }}"
         email_template: "{{ user.email }}"
 ```
+
+### Mastodon
+
+[Mastodon](https://docs.joinmastodon.org/) instances provide an [OAuth API](https://docs.joinmastodon.org/spec/oauth/), allowing those instances to be used as a single sign-on provider for Synapse.
+
+The first step is to register Synapse as an application with your Mastodon instance, using the [Create an application API](https://docs.joinmastodon.org/methods/apps/#create) (see also [here](https://docs.joinmastodon.org/client/token/)). There are several ways to do this, but in the example below we are using CURL.
+
+This example assumes that:
+* the Mastodon instance website URL is `https://your.mastodon.instance.url`, and
+* Synapse will be registered as an app named `my_synapse_app`.
+
+Send the following request, substituting the value of `synapse_public_baseurl` from your Synapse installation.
+```sh
+curl -d "client_name=my_synapse_app&redirect_uris=https://[synapse_public_baseurl]/_synapse/client/oidc/callback" -X POST https://your.mastodon.instance.url/api/v1/apps
+```
+
+You should receive a response similar to the following. Make sure to save it.
+```json
+{"client_id":"someclientid_123","client_secret":"someclientsecret_123","id":"12345","name":"my_synapse_app","redirect_uri":"https://[synapse_public_baseurl]/_synapse/client/oidc/callback","website":null,"vapid_key":"somerandomvapidkey_123"}
+```
+
+As the Synapse login mechanism needs an attribute to uniquely identify users, and Mastodon's endpoint does not return a `sub` property, an alternative `subject_claim` has to be set. Your Synapse configuration should include the following:
+
+```yaml
+oidc_providers:
+  - idp_id: my_mastodon
+    idp_name: "Mastodon Instance Example"
+    discover: false
+    issuer: "https://your.mastodon.instance.url/@admin"
+    client_id: "someclientid_123"    
+    client_secret: "someclientsecret_123"
+    authorization_endpoint: "https://your.mastodon.instance.url/oauth/authorize"
+    token_endpoint: "https://your.mastodon.instance.url/oauth/token"
+    userinfo_endpoint: "https://your.mastodon.instance.url/api/v1/accounts/verify_credentials"
+    scopes: ["read"]
+    user_mapping_provider:
+      config:
+        subject_claim: "id"
+```
+
+Note that the fields `client_id` and `client_secret` are taken from the CURL response above.

@@ -21,7 +21,7 @@ from synapse.api.errors import StoreError
 from synapse.logging.opentracing import log_kv, trace
 from synapse.storage._base import SQLBaseStore, db_to_json
 from synapse.storage.database import LoggingTransaction
-from synapse.types import JsonDict, JsonSerializable
+from synapse.types import JsonDict, JsonSerializable, StreamKeyType
 from synapse.util import json_encoder
 
 
@@ -126,7 +126,7 @@ class EndToEndRoomKeyStore(SQLBaseStore):
                     "message": "Set room key",
                     "room_id": room_id,
                     "session_id": session_id,
-                    "room_key": room_key,
+                    StreamKeyType.ROOM: room_key,
                 }
             )
 
@@ -391,10 +391,10 @@ class EndToEndRoomKeyStore(SQLBaseStore):
         Returns:
             A dict giving the info metadata for this backup version, with
             fields including:
-                version(str)
-                algorithm(str)
-                auth_data(object): opaque dict supplied by the client
-                etag(int): tag of the keys in the backup
+                version (str)
+                algorithm (str)
+                auth_data (object): opaque dict supplied by the client
+                etag (int): tag of the keys in the backup
         """
 
         def _get_e2e_room_keys_version_info_txn(txn: LoggingTransaction) -> JsonDict:

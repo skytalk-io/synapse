@@ -126,6 +126,13 @@ class PresenceRouterTestModule:
 
 
 class PresenceRouterTestCase(FederatingHomeserverTestCase):
+    """
+    Test cases using a custom PresenceRouter
+
+    By default in test cases, federation sending is disabled. This class re-enables it
+    for the main process by setting `federation_sender_instances` to None.
+    """
+
     servlets = [
         admin.register_servlets,
         login.register_servlets,
@@ -141,10 +148,6 @@ class PresenceRouterTestCase(FederatingHomeserverTestCase):
         hs = self.setup_test_homeserver(
             federation_transport_client=fed_transport_client,
         )
-        # Load the modules into the homeserver
-        module_api = hs.get_module_api()
-        for module, config in hs.config.modules.loaded_modules:
-            module(config=config, api=module_api)
 
         load_legacy_presence_router(hs)
 
@@ -153,6 +156,11 @@ class PresenceRouterTestCase(FederatingHomeserverTestCase):
     def prepare(self, reactor, clock, homeserver):
         self.sync_handler = self.hs.get_sync_handler()
         self.module_api = homeserver.get_module_api()
+
+    def default_config(self) -> JsonDict:
+        config = super().default_config()
+        config["federation_sender_instances"] = None
+        return config
 
     @override_config(
         {
@@ -166,7 +174,6 @@ class PresenceRouterTestCase(FederatingHomeserverTestCase):
                     },
                 }
             },
-            "send_federation": True,
         }
     )
     def test_receiving_all_presence_legacy(self):
@@ -184,7 +191,6 @@ class PresenceRouterTestCase(FederatingHomeserverTestCase):
                     },
                 },
             ],
-            "send_federation": True,
         }
     )
     def test_receiving_all_presence(self):
@@ -294,7 +300,6 @@ class PresenceRouterTestCase(FederatingHomeserverTestCase):
                     },
                 }
             },
-            "send_federation": True,
         }
     )
     def test_send_local_online_presence_to_with_module_legacy(self):
@@ -314,7 +319,6 @@ class PresenceRouterTestCase(FederatingHomeserverTestCase):
                     },
                 },
             ],
-            "send_federation": True,
         }
     )
     def test_send_local_online_presence_to_with_module(self):
@@ -439,7 +443,7 @@ class PresenceRouterTestCase(FederatingHomeserverTestCase):
 
             for edu in edus:
                 # Make sure we're only checking presence-type EDUs
-                if edu["edu_type"] != EduTypes.Presence:
+                if edu["edu_type"] != EduTypes.PRESENCE:
                     continue
 
                 # EDUs can contain multiple presence updates

@@ -12,9 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+
+from twisted.test.proto_helpers import MemoryReactor
+
+from synapse.api.constants import RoomTypes
 from synapse.rest import admin
 from synapse.rest.client import login, room
+from synapse.server import HomeServer
 from synapse.storage.databases.main.room import _BackgroundUpdates
+from synapse.util import Clock
 
 from tests.unittest import HomeserverTestCase
 
@@ -27,7 +34,7 @@ class RoomBackgroundUpdateStoreTestCase(HomeserverTestCase):
         login.register_servlets,
     ]
 
-    def prepare(self, reactor, clock, hs):
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
         self.store = hs.get_datastores().main
         self.user_id = self.register_user("foo", "pass")
         self.token = self.login("foo", "pass")
@@ -37,7 +44,7 @@ class RoomBackgroundUpdateStoreTestCase(HomeserverTestCase):
 
         return room_id
 
-    def test_background_populate_rooms_creator_column(self):
+    def test_background_populate_rooms_creator_column(self) -> None:
         """Test that the background update to populate the rooms creator column
         works properly.
         """
@@ -91,3 +98,69 @@ class RoomBackgroundUpdateStoreTestCase(HomeserverTestCase):
             )
         )
         self.assertEqual(room_creator_after, self.user_id)
+
+    def test_background_add_room_type_column(self) -> None:
+        """Test that the background update to populate the `room_type` column in
+        `room_stats_state` works properly.
+        """
+
+        # Create a room without a type
+        room_id = self._generate_room()
+
+        # Get event_id of the m.room.create event
+        event_id = self.get_success(
+            self.store.db_pool.simple_select_one_onecol(
+                table="current_state_events",
+                keyvalues={
+                    "room_id": room_id,
+                    "type": "m.room.create",
+                },
+                retcol="event_id",
+            )
+        )
+
+        # Fake a room creation event with a room type
+        event = {
+            "content": {
+                "creator": "@user:server.org",
+                "room_version": "9",
+                "type": RoomTypes.SPACE,
+            },
+            "type": "m.room.create",
+        }
+        self.get_success(
+            self.store.db_pool.simple_update(
+                table="event_json",
+                keyvalues={"event_id": event_id},
+                updatevalues={"json": json.dumps(event)},
+                desc="test",
+            )
+        )
+
+        # Insert and run the background update
+        self.get_success(
+            self.store.db_pool.simple_insert(
+                "background_updates",
+                {
+                    "update_name": _BackgroundUpdates.ADD_ROOM_TYPE_COLUMN,
+                    "progress_json": "{}",
+                },
+            )
+        )
+
+        # ... and tell the DataStore that it hasn't finished all updates yet
+        self.store.db_pool.updates._all_done = False
+
+        # Now let's actually drive the updates to completion
+        self.wait_for_background_updates()
+
+        # Make sure the background update filled in the room type
+        room_type_after = self.get_success(
+            self.store.db_pool.simple_select_one_onecol(
+                table="room_stats_state",
+                keyvalues={"room_id": room_id},
+                retcol="room_type",
+                allow_none=True,
+            )
+        )
+        self.assertEqual(room_type_after, RoomTypes.SPACE)

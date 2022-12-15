@@ -22,7 +22,6 @@ from synapse.api.errors import (
     ResourceLimitError,
     SynapseError,
 )
-from synapse.events.spamcheck import load_legacy_spam_checkers
 from synapse.spam_checker_api import RegistrationBehaviour
 from synapse.types import RoomAlias, RoomID, UserID, create_requester
 
@@ -144,12 +143,6 @@ class RegistrationTestCase(unittest.HomeserverTestCase):
             config=hs_config, federation_client=self.mock_federation_client
         )
 
-        load_legacy_spam_checkers(hs)
-
-        module_api = hs.get_module_api()
-        for module, config in hs.config.modules.loaded_modules:
-            module(config=config, api=module_api)
-
         return hs
 
     def prepare(self, reactor, clock, hs):
@@ -193,8 +186,7 @@ class RegistrationTestCase(unittest.HomeserverTestCase):
 
     @override_config({"limit_usage_by_mau": True})
     def test_get_or_create_user_mau_not_blocked(self):
-        # Type ignore: mypy doesn't like us assigning to methods.
-        self.store.count_monthly_users = Mock(  # type: ignore[assignment]
+        self.store.count_monthly_users = Mock(
             return_value=make_awaitable(self.hs.config.server.max_mau_value - 1)
         )
         # Ensure does not throw exception
@@ -202,8 +194,7 @@ class RegistrationTestCase(unittest.HomeserverTestCase):
 
     @override_config({"limit_usage_by_mau": True})
     def test_get_or_create_user_mau_blocked(self):
-        # Type ignore: mypy doesn't like us assigning to methods.
-        self.store.get_monthly_active_count = Mock(  # type: ignore[assignment]
+        self.store.get_monthly_active_count = Mock(
             return_value=make_awaitable(self.lots_of_users)
         )
         self.get_failure(
@@ -211,8 +202,7 @@ class RegistrationTestCase(unittest.HomeserverTestCase):
             ResourceLimitError,
         )
 
-        # Type ignore: mypy doesn't like us assigning to methods.
-        self.store.get_monthly_active_count = Mock(  # type: ignore[assignment]
+        self.store.get_monthly_active_count = Mock(
             return_value=make_awaitable(self.hs.config.server.max_mau_value)
         )
         self.get_failure(
@@ -507,7 +497,9 @@ class RegistrationTestCase(unittest.HomeserverTestCase):
             )
         )
         self.get_success(
-            event_creation_handler.handle_new_client_event(requester, event, context)
+            event_creation_handler.handle_new_client_event(
+                requester, events_and_context=[(event, context)]
+            )
         )
 
         # Register a second user, which won't be be in the room (or even have an invite)
@@ -702,7 +694,7 @@ class RegistrationTestCase(unittest.HomeserverTestCase):
         """
         if localpart is None:
             raise SynapseError(400, "Request must include user id")
-        await self.hs.get_auth().check_auth_blocking()
+        await self.hs.get_auth_blocking().check_auth_blocking()
         need_register = True
 
         try:

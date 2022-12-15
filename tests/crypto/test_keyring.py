@@ -19,8 +19,8 @@ import attr
 import canonicaljson
 import signedjson.key
 import signedjson.sign
-from nacl.signing import SigningKey
 from signedjson.key import encode_verify_key_base64, get_verify_key
+from signedjson.types import SigningKey
 
 from twisted.internet import defer
 from twisted.internet.defer import Deferred, ensureDeferred
@@ -433,7 +433,7 @@ class ServerKeyFetcherTestCase(unittest.HomeserverTestCase):
 
         async def get_json(destination, path, **kwargs):
             self.assertEqual(destination, SERVER_NAME)
-            self.assertEqual(path, "/_matrix/key/v2/server/key1")
+            self.assertEqual(path, "/_matrix/key/v2/server")
             return response
 
         self.http_client.get_json.side_effect = get_json

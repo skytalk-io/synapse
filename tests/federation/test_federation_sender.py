@@ -19,28 +19,43 @@ from signedjson.types import BaseKey, SigningKey
 
 from twisted.internet import defer
 
-from synapse.api.constants import RoomEncryptionAlgorithms
+from synapse.api.constants import EduTypes, RoomEncryptionAlgorithms
 from synapse.rest import admin
 from synapse.rest.client import login
 from synapse.types import JsonDict, ReadReceipt
 
 from tests.test_utils import make_awaitable
-from tests.unittest import HomeserverTestCase, override_config
+from tests.unittest import HomeserverTestCase
 
 
 class FederationSenderReceiptsTestCases(HomeserverTestCase):
+    """
+    Test federation sending to update receipts.
+
+    By default for test cases federation sending is disabled. This Test class has it
+    re-enabled for the main process.
+    """
+
     def make_homeserver(self, reactor, clock):
-        mock_state_handler = Mock(spec=["get_current_hosts_in_room"])
-        # Ensure a new Awaitable is created for each call.
-        mock_state_handler.get_current_hosts_in_room.return_value = make_awaitable(
-            ["test", "host2"]
-        )
-        return self.setup_test_homeserver(
-            state_handler=mock_state_handler,
+        hs = self.setup_test_homeserver(
             federation_transport_client=Mock(spec=["send_transaction"]),
         )
 
-    @override_config({"send_federation": True})
+        hs.get_storage_controllers().state.get_current_hosts_in_room = Mock(
+            return_value=make_awaitable({"test", "host2"})
+        )
+
+        hs.get_storage_controllers().state.get_current_hosts_in_room_or_partial_state_approximation = (
+            hs.get_storage_controllers().state.get_current_hosts_in_room
+        )
+
+        return hs
+
+    def default_config(self) -> JsonDict:
+        config = super().default_config()
+        config["federation_sender_instances"] = None
+        return config
+
     def test_send_receipts(self):
         mock_send_transaction = (
             self.hs.get_federation_transport_client().send_transaction
@@ -49,7 +64,12 @@ class FederationSenderReceiptsTestCases(HomeserverTestCase):
 
         sender = self.hs.get_federation_sender()
         receipt = ReadReceipt(
-            "room_id", "m.read", "user_id", ["event_id"], {"ts": 1234}
+            "room_id",
+            "m.read",
+            "user_id",
+            ["event_id"],
+            thread_id=None,
+            data={"ts": 1234},
         )
         self.successResultOf(defer.ensureDeferred(sender.send_read_receipt(receipt)))
 
@@ -63,7 +83,7 @@ class FederationSenderReceiptsTestCases(HomeserverTestCase):
             data["edus"],
             [
                 {
-                    "edu_type": "m.receipt",
+                    "edu_type": EduTypes.RECEIPT,
                     "content": {
                         "room_id": {
                             "m.read": {
@@ -78,7 +98,82 @@ class FederationSenderReceiptsTestCases(HomeserverTestCase):
             ],
         )
 
-    @override_config({"send_federation": True})
+    def test_send_receipts_thread(self):
+        mock_send_transaction = (
+            self.hs.get_federation_transport_client().send_transaction
+        )
+        mock_send_transaction.return_value = make_awaitable({})
+
+        # Create receipts for:
+        #
+        # * The same room / user on multiple threads.
+        # * A different user in the same room.
+        sender = self.hs.get_federation_sender()
+        for user, thread in (
+            ("alice", None),
+            ("alice", "thread"),
+            ("bob", None),
+            ("bob", "diff-thread"),
+        ):
+            receipt = ReadReceipt(
+                "room_id",
+                "m.read",
+                user,
+                ["event_id"],
+                thread_id=thread,
+                data={"ts": 1234},
+            )
+            self.successResultOf(
+                defer.ensureDeferred(sender.send_read_receipt(receipt))
+            )
+
+        self.pump()
+
+        # expect a call to send_transaction with two EDUs to separate threads.
+        mock_send_transaction.assert_called_once()
+        json_cb = mock_send_transaction.call_args[0][1]
+        data = json_cb()
+        # Note that the ordering of the EDUs doesn't matter.
+        self.assertCountEqual(
+            data["edus"],
+            [
+                {
+                    "edu_type": EduTypes.RECEIPT,
+                    "content": {
+                        "room_id": {
+                            "m.read": {
+                                "alice": {
+                                    "event_ids": ["event_id"],
+                                    "data": {"ts": 1234, "thread_id": "thread"},
+                                },
+                                "bob": {
+                                    "event_ids": ["event_id"],
+                                    "data": {"ts": 1234, "thread_id": "diff-thread"},
+                                },
+                            }
+                        }
+                    },
+                },
+                {
+                    "edu_type": EduTypes.RECEIPT,
+                    "content": {
+                        "room_id": {
+                            "m.read": {
+                                "alice": {
+                                    "event_ids": ["event_id"],
+                                    "data": {"ts": 1234},
+                                },
+                                "bob": {
+                                    "event_ids": ["event_id"],
+                                    "data": {"ts": 1234},
+                                },
+                            }
+                        }
+                    },
+                },
+            ],
+        )
+
     def test_send_receipts_with_backoff(self):
         """Send two receipts in quick succession; the second should be flushed, but
         only after 20ms"""
@@ -89,7 +184,12 @@ class FederationSenderReceiptsTestCases(HomeserverTestCase):
 
         sender = self.hs.get_federation_sender()
         receipt = ReadReceipt(
-            "room_id", "m.read", "user_id", ["event_id"], {"ts": 1234}
+            "room_id",
+            "m.read",
+            "user_id",
+            ["event_id"],
+            thread_id=None,
+            data={"ts": 1234},
         )
         self.successResultOf(defer.ensureDeferred(sender.send_read_receipt(receipt)))
 
@@ -103,7 +203,7 @@ class FederationSenderReceiptsTestCases(HomeserverTestCase):
             data["edus"],
             [
                 {
-                    "edu_type": "m.receipt",
+                    "edu_type": EduTypes.RECEIPT,
                     "content": {
                         "room_id": {
                             "m.read": {
@@ -121,7 +221,12 @@ class FederationSenderReceiptsTestCases(HomeserverTestCase):
 
         # send the second RR
         receipt = ReadReceipt(
-            "room_id", "m.read", "user_id", ["other_id"], {"ts": 1234}
+            "room_id",
+            "m.read",
+            "user_id",
+            ["other_id"],
+            thread_id=None,
+            data={"ts": 1234},
         )
         self.successResultOf(defer.ensureDeferred(sender.send_read_receipt(receipt)))
         self.pump()
@@ -138,7 +243,7 @@ class FederationSenderReceiptsTestCases(HomeserverTestCase):
             data["edus"],
             [
                 {
-                    "edu_type": "m.receipt",
+                    "edu_type": EduTypes.RECEIPT,
                     "content": {
                         "room_id": {
                             "m.read": {
@@ -155,6 +260,13 @@ class FederationSenderReceiptsTestCases(HomeserverTestCase):
 
 
 class FederationSenderDevicesTestCases(HomeserverTestCase):
+    """
+    Test federation sending to update devices.
+
+    By default for test cases federation sending is disabled. This Test class has it
+    re-enabled for the main process.
+    """
+
     servlets = [
         admin.register_servlets,
         login.register_servlets,
@@ -162,23 +274,36 @@ class FederationSenderDevicesTestCases(HomeserverTestCase):
 
     def make_homeserver(self, reactor, clock):
         return self.setup_test_homeserver(
-            federation_transport_client=Mock(spec=["send_transaction"]),
+            federation_transport_client=Mock(
+                spec=["send_transaction", "query_user_devices"]
+            ),
         )
 
     def default_config(self):
         c = super().default_config()
-        c["send_federation"] = True
+        # Enable federation sending on the main process.
+        c["federation_sender_instances"] = None
         return c
 
     def prepare(self, reactor, clock, hs):
-        # stub out get_users_who_share_room_with_user so that it claims that
-        # `@user2:host2` is in the room
-        def get_users_who_share_room_with_user(user_id):
-            return defer.succeed({"@user2:host2"})
+        test_room_id = "!room:host1"
 
-        hs.get_datastores().main.get_users_who_share_room_with_user = (
-            get_users_who_share_room_with_user
-        )
+        # stub out `get_rooms_for_user` and `get_current_hosts_in_room` so that the
+        # server thinks the user shares a room with `@user2:host2`
+        def get_rooms_for_user(user_id):
+            return defer.succeed({test_room_id})
+
+        hs.get_datastores().main.get_rooms_for_user = get_rooms_for_user
+
+        async def get_current_hosts_in_room(room_id):
+            if room_id == test_room_id:
+                return ["host2"]
+
+            # TODO: We should fail the test when we encounter an unxpected room ID.
+            # We can't just use `self.fail(...)` here because the app code is greedy
+            # with `Exception` and will catch it before the test can see it.
+
+        hs.get_datastores().main.get_current_hosts_in_room = get_current_hosts_in_room
 
         # whenever send_transaction is called, record the edu data
         self.edus = []
@@ -201,9 +326,12 @@ class FederationSenderDevicesTestCases(HomeserverTestCase):
         self.assertEqual(len(self.edus), 1)
         stream_id = self.check_device_update_edu(self.edus.pop(0), u1, "D1", None)
 
+        # We queue up device list updates to be sent over federation, so we
+        # advance to clear the queue.
+        self.reactor.advance(1)
+
         # a second call should produce no new device EDUs
         self.hs.get_federation_sender().send_device_messages("host2")
-        self.pump()
         self.assertEqual(self.edus, [])
 
         # a second device
@@ -211,6 +339,45 @@ class FederationSenderDevicesTestCases(HomeserverTestCase):
 
         self.assertEqual(len(self.edus), 1)
         self.check_device_update_edu(self.edus.pop(0), u1, "D2", stream_id)
+
+    def test_dont_send_device_updates_for_remote_users(self):
+        """Check that we don't send device updates for remote users"""
+
+        # Send the server a device list EDU for the other user, this will cause
+        # it to try and resync the device lists.
+        self.hs.get_federation_transport_client().query_user_devices.return_value = (
+            make_awaitable(
+                {
+                    "stream_id": "1",
+                    "user_id": "@user2:host2",
+                    "devices": [{"device_id": "D1"}],
+                }
+            )
+        )
+
+        self.get_success(
+            self.hs.get_device_handler().device_list_updater.incoming_device_list_update(
+                "host2",
+                {
+                    "user_id": "@user2:host2",
+                    "device_id": "D1",
+                    "stream_id": "1",
+                    "prev_ids": [],
+                },
+            )
+        )
+
+        self.reactor.advance(1)
+
+        # We shouldn't see an EDU for that update
+        self.assertEqual(self.edus, [])
+
+        # Check that we did successfully process the inbound EDU (otherwise this
+        # test would pass if we failed to process the EDU)
+        devices = self.get_success(
+            self.hs.get_datastores().main.get_cached_devices_for_user("@user2:host2")
+        )
+        self.assertIn("D1", devices)
 
     def test_upload_signatures(self):
         """Uploading signatures on some devices should produce updates for that user"""
@@ -231,6 +398,10 @@ class FederationSenderDevicesTestCases(HomeserverTestCase):
         # upload signing keys for each device
         device1_signing_key = self.generate_and_upload_device_signing_key(u1, "D1")
         device2_signing_key = self.generate_and_upload_device_signing_key(u1, "D2")
+
+        # We queue up device list updates to be sent over federation, so we
+        # advance to clear the queue.
+        self.reactor.advance(1)
 
         # expect two more edus
         self.assertEqual(len(self.edus), 2)
@@ -265,10 +436,16 @@ class FederationSenderDevicesTestCases(HomeserverTestCase):
             e2e_handler.upload_signing_keys_for_user(u1, cross_signing_keys)
         )
 
+        # We queue up device list updates to be sent over federation, so we
+        # advance to clear the queue.
+        self.reactor.advance(1)
+
         # expect signing key update edu
         self.assertEqual(len(self.edus), 2)
-        self.assertEqual(self.edus.pop(0)["edu_type"], "m.signing_key_update")
-        self.assertEqual(self.edus.pop(0)["edu_type"], "org.matrix.signing_key_update")
+        self.assertEqual(self.edus.pop(0)["edu_type"], EduTypes.SIGNING_KEY_UPDATE)
+        self.assertEqual(
+            self.edus.pop(0)["edu_type"], EduTypes.UNSTABLE_SIGNING_KEY_UPDATE
+        )
 
         # sign the devices
         d1_json = build_device_dict(u1, "D1", device1_signing_key)
@@ -284,12 +461,16 @@ class FederationSenderDevicesTestCases(HomeserverTestCase):
         )
         self.assertEqual(ret["failures"], {})
 
+        # We queue up device list updates to be sent over federation, so we
+        # advance to clear the queue.
+        self.reactor.advance(1)
+
         # expect two edus, in one or two transactions. We don't know what order the
         # devices will be updated.
         self.assertEqual(len(self.edus), 2)
         stream_id = None  # FIXME: there is a discontinuity in the stream IDs: see #7142
         for edu in self.edus:
-            self.assertEqual(edu["edu_type"], "m.device_list_update")
+            self.assertEqual(edu["edu_type"], EduTypes.DEVICE_LIST_UPDATE)
             c = edu["content"]
             if stream_id is not None:
                 self.assertEqual(c["prev_id"], [stream_id])
@@ -307,6 +488,10 @@ class FederationSenderDevicesTestCases(HomeserverTestCase):
         self.login("user", "pass", device_id="D2")
         self.login("user", "pass", device_id="D3")
 
+        # We queue up device list updates to be sent over federation, so we
+        # advance to clear the queue.
+        self.reactor.advance(1)
+
         # expect three edus
         self.assertEqual(len(self.edus), 3)
         stream_id = self.check_device_update_edu(self.edus.pop(0), u1, "D1", None)
@@ -318,10 +503,14 @@ class FederationSenderDevicesTestCases(HomeserverTestCase):
             self.hs.get_device_handler().delete_devices(u1, ["D1", "D2", "D3"])
         )
 
+        # We queue up device list updates to be sent over federation, so we
+        # advance to clear the queue.
+        self.reactor.advance(1)
+
         # expect three edus, in an unknown order
         self.assertEqual(len(self.edus), 3)
         for edu in self.edus:
-            self.assertEqual(edu["edu_type"], "m.device_list_update")
+            self.assertEqual(edu["edu_type"], EduTypes.DEVICE_LIST_UPDATE)
             c = edu["content"]
             self.assertGreaterEqual(
                 c.items(),
@@ -350,18 +539,25 @@ class FederationSenderDevicesTestCases(HomeserverTestCase):
             self.hs.get_device_handler().delete_devices(u1, ["D1", "D2", "D3"])
         )
 
+        # We queue up device list updates to be sent over federation, so we
+        # advance to clear the queue.
+        self.reactor.advance(1)
+
         self.assertGreaterEqual(mock_send_txn.call_count, 4)
 
         # recover the server
         mock_send_txn.side_effect = self.record_transaction
         self.hs.get_federation_sender().send_device_messages("host2")
-        self.pump()
+
+        # We queue up device list updates to be sent over federation, so we
+        # advance to clear the queue.
+        self.reactor.advance(1)
 
         # for each device, there should be a single update
         self.assertEqual(len(self.edus), 3)
         stream_id = None
         for edu in self.edus:
-            self.assertEqual(edu["edu_type"], "m.device_list_update")
+            self.assertEqual(edu["edu_type"], EduTypes.DEVICE_LIST_UPDATE)
             c = edu["content"]
             self.assertEqual(c["prev_id"], [stream_id] if stream_id is not None else [])
             if stream_id is not None:
@@ -390,6 +586,10 @@ class FederationSenderDevicesTestCases(HomeserverTestCase):
             self.hs.get_device_handler().delete_devices(u1, ["D1", "D2", "D3"])
         )
 
+        # We queue up device list updates to be sent over federation, so we
+        # advance to clear the queue.
+        self.reactor.advance(1)
+
         self.assertGreaterEqual(mock_send_txn.call_count, 4)
 
         # run the prune job
@@ -401,12 +601,15 @@ class FederationSenderDevicesTestCases(HomeserverTestCase):
         # recover the server
         mock_send_txn.side_effect = self.record_transaction
         self.hs.get_federation_sender().send_device_messages("host2")
-        self.pump()
+
+        # We queue up device list updates to be sent over federation, so we
+        # advance to clear the queue.
+        self.reactor.advance(1)
 
         # there should be a single update for this user.
         self.assertEqual(len(self.edus), 1)
         edu = self.edus.pop(0)
-        self.assertEqual(edu["edu_type"], "m.device_list_update")
+        self.assertEqual(edu["edu_type"], EduTypes.DEVICE_LIST_UPDATE)
         c = edu["content"]
 
         # synapse uses an empty prev_id list to indicate "needs a full resync".
@@ -435,6 +638,10 @@ class FederationSenderDevicesTestCases(HomeserverTestCase):
         self.login("user", "pass", device_id="D2")
         self.login("user", "pass", device_id="D3")
 
+        # We queue up device list updates to be sent over federation, so we
+        # advance to clear the queue.
+        self.reactor.advance(1)
+
         # delete them again
         self.get_success(
             self.hs.get_device_handler().delete_devices(u1, ["D1", "D2", "D3"])
@@ -451,12 +658,15 @@ class FederationSenderDevicesTestCases(HomeserverTestCase):
         # recover the server
         mock_send_txn.side_effect = self.record_transaction
         self.hs.get_federation_sender().send_device_messages("host2")
-        self.pump()
+
+        # We queue up device list updates to be sent over federation, so we
+        # advance to clear the queue.
+        self.reactor.advance(1)
 
         # ... and we should get a single update for this user.
         self.assertEqual(len(self.edus), 1)
         edu = self.edus.pop(0)
-        self.assertEqual(edu["edu_type"], "m.device_list_update")
+        self.assertEqual(edu["edu_type"], EduTypes.DEVICE_LIST_UPDATE)
         c = edu["content"]
 
         # synapse uses an empty prev_id list to indicate "needs a full resync".
@@ -472,7 +682,7 @@ class FederationSenderDevicesTestCases(HomeserverTestCase):
         """Check that the given EDU is an update for the given device
         Returns the stream_id.
         """
-        self.assertEqual(edu["edu_type"], "m.device_list_update")
+        self.assertEqual(edu["edu_type"], EduTypes.DEVICE_LIST_UPDATE)
         content = edu["content"]
 
         expected = {

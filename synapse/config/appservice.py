@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import logging
-from typing import Dict, List
+from typing import Any, Dict, List
 from urllib import parse as urlparse
 
 import yaml
@@ -31,24 +31,9 @@ logger = logging.getLogger(__name__)
 class AppServiceConfig(Config):
     section = "appservice"
 
-    def read_config(self, config, **kwargs) -> None:
+    def read_config(self, config: JsonDict, **kwargs: Any) -> None:
         self.app_service_config_files = config.get("app_service_config_files", [])
-        self.notify_appservices = config.get("notify_appservices", True)
         self.track_appservice_user_ips = config.get("track_appservice_user_ips", False)
-
-    def generate_config_section(cls, **kwargs) -> str:
-        return """\
-        # A list of application service config files to use
-        #
-        #app_service_config_files:
-        #  - app_service_1.yaml
-        #  - app_service_2.yaml
-
-        # Uncomment to enable tracking of application service IP addresses. Implicitly
-        # enables MAU tracking for application service users.
-        #
-        #track_appservice_user_ips: true
-        """
 
 
 def load_appservices(
@@ -56,7 +41,8 @@ def load_appservices(
 ) -> List[ApplicationService]:
     """Returns a list of Application Services from the config files."""
     if not isinstance(config_files, list):
-        logger.warning("Expected %s to be a list of AS config files.", config_files)
+        # type-ignore: this function gets arbitrary json value; we do use this path.
+        logger.warning("Expected %s to be a list of AS config files.", config_files)  # type: ignore[unreachable]
         return []
 
     # Dicts of value -> filename
@@ -170,6 +156,7 @@ def _load_appservice(
     # When enabled, appservice transactions contain the following information:
     #  - device One-Time Key counts
     #  - device unused fallback key usage states
+    #  - device list changes
     msc3202_transaction_extensions = as_info.get("org.matrix.msc3202", False)
     if not isinstance(msc3202_transaction_extensions, bool):
         raise ValueError(
@@ -178,7 +165,6 @@ def _load_appservice(
 
     return ApplicationService(
         token=as_info["as_token"],
-        hostname=hostname,
         url=as_info["url"],
         namespaces=as_info["namespaces"],
         hs_token=as_info["hs_token"],

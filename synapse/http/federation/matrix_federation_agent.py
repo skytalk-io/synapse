@@ -155,11 +155,10 @@ class MatrixFederationAgent:
                 a file for a file upload).  Or None if the request is to have
                 no body.
         Returns:
-            Deferred[twisted.web.iweb.IResponse]:
-                fires when the header of the response has been received (regardless of the
-                response status code). Fails if there is any problem which prevents that
-                response from being received (including problems that prevent the request
-                from being sent).
+            A deferred which fires when the header of the response has been received
+            (regardless of the response status code). Fails if there is any problem
+            which prevents that response from being received (including problems that
+            prevent the request from being sent).
         """
         # We use urlparse as that will set `port` to None if there is no
         # explicit port.
@@ -239,7 +238,7 @@ class MatrixHostnameEndpointFactory:
 
         self._srv_resolver = srv_resolver
 
-    def endpointForURI(self, parsed_uri: URI):
+    def endpointForURI(self, parsed_uri: URI) -> "MatrixHostnameEndpoint":
         return MatrixHostnameEndpoint(
             self._reactor,
             self._proxy_reactor,
