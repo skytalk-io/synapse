@@ -25,5 +25,8 @@ jobs:
         destination_branch: develop
         github_token: ${{ secrets.CILICON_GITHUB_PAT }}
         pr_title: "Pulling ${{ github.ref }} into develop"
-        pr_body: ":crown: *An automated PR to sync with upstream*"
+        pr_body: |
+          :crown: *An automated PR to sync with upstream*
+          
+          Co-authored-by: cuttingedge1109 cuttingedge1109@users.noreply.github.com
         pr_reviewer: "cmpayc"
