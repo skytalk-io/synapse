@@ -16,6 +16,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Tuple
 
 from synapse.api.errors import NotFoundError, SynapseError
+from synapse.handlers.device import DeviceHandler
 from synapse.http.servlet import (
     RestServlet,
     assert_params_in_dict,
@@ -43,7 +44,9 @@ class DeviceRestServlet(RestServlet):
     def __init__(self, hs: "HomeServer"):
         super().__init__()
         self.auth = hs.get_auth()
-        self.device_handler = hs.get_device_handler()
+        handler = hs.get_device_handler()
+        assert isinstance(handler, DeviceHandler)
+        self.device_handler = handler
         self.store = hs.get_datastores().main
         self.is_mine = hs.is_mine
 
@@ -80,7 +83,7 @@ class DeviceRestServlet(RestServlet):
         if u is None:
             raise NotFoundError("Unknown user")
 
-        await self.device_handler.delete_device(target_user.to_string(), device_id)
+        await self.device_handler.delete_devices(target_user.to_string(), [device_id])
         return HTTPStatus.OK, {}
 
     async def on_PUT(
@@ -112,7 +115,9 @@ class DevicesRestServlet(RestServlet):
 
     def __init__(self, hs: "HomeServer"):
         self.auth = hs.get_auth()
-        self.device_handler = hs.get_device_handler()
+        handler = hs.get_device_handler()
+        assert isinstance(handler, DeviceHandler)
+        self.device_handler = handler
         self.store = hs.get_datastores().main
         self.is_mine = hs.is_mine
 
@@ -143,7 +148,9 @@ class DeleteDevicesRestServlet(RestServlet):
 
     def __init__(self, hs: "HomeServer"):
         self.auth = hs.get_auth()
-        self.device_handler = hs.get_device_handler()
+        handler = hs.get_device_handler()
+        assert isinstance(handler, DeviceHandler)
+        self.device_handler = handler
         self.store = hs.get_datastores().main
         self.is_mine = hs.is_mine
 

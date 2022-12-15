@@ -16,11 +16,16 @@
 """ This module contains REST servlets to do with rooms: /rooms/<paths> """
 import logging
 import re
+from enum import Enum
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Awaitable, Dict, List, Optional, Tuple
 from urllib import parse as urlparse
 
+from prometheus_client.core import Histogram
+
 from twisted.web.server import Request
 
+from synapse import event_auth
 from synapse.api.constants import EventTypes, Membership
 from synapse.api.errors import (
     AuthError,
@@ -29,6 +34,7 @@ from synapse.api.errors import (
     MissingClientTokenError,
     ShadowBanError,
     SynapseError,
+    UnredactedContentDeletedError,
 )
 from synapse.api.filtering import Filter
 from synapse.events.utils import format_event_for_client_v2
@@ -44,19 +50,86 @@ from synapse.http.servlet import (
     parse_strings_from_args,
 )
 from synapse.http.site import SynapseRequest
+from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.logging.opentracing import set_tag
+from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.rest.client._base import client_patterns
 from synapse.rest.client.transactions import HttpTransactionCache
-from synapse.storage.state import StateFilter
 from synapse.streams.config import PaginationConfig
 from synapse.types import JsonDict, StreamToken, ThirdPartyInstanceID, UserID
+from synapse.types.state import StateFilter
 from synapse.util import json_decoder
+from synapse.util.cancellation import cancellable
 from synapse.util.stringutils import parse_and_validate_server_name, random_string
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
+
+
+class _RoomSize(Enum):
+    """
+    Enum to differentiate sizes of rooms. This is a pretty good approximation
+    about how hard it will be to get events in the room. We could also look at
+    room "complexity".
+    """
+
+    # This doesn't necessarily mean the room is a DM, just that there is a DM
+    # amount of people there.
+    DM_SIZE = "direct_message_size"
+    SMALL = "small"
+    SUBSTANTIAL = "substantial"
+    LARGE = "large"
+
+    @staticmethod
+    def from_member_count(member_count: int) -> "_RoomSize":
+        if member_count <= 2:
+            return _RoomSize.DM_SIZE
+        elif member_count < 100:
+            return _RoomSize.SMALL
+        elif member_count < 1000:
+            return _RoomSize.SUBSTANTIAL
+        else:
+            return _RoomSize.LARGE
+
+
+# This is an extra metric on top of `synapse_http_server_response_time_seconds`
+# which times the same sort of thing but this one allows us to see values
+# greater than 10s. We use a separate dedicated histogram with its own buckets
+# so that we don't increase the cardinality of the general one because it's
+# multiplied across hundreds of servlets.
+messsages_response_timer = Histogram(
+    "synapse_room_message_list_rest_servlet_response_time_seconds",
+    "sec",
+    # We have a label for room size so we can try to see a more realistic
+    # picture of /messages response time for bigger rooms. We don't want the
+    # tiny rooms that can always respond fast skewing our results when we're trying
+    # to optimize the bigger cases.
+    ["room_size"],
+    buckets=(
+        0.005,
+        0.01,
+        0.025,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        10.0,
+        20.0,
+        30.0,
+        60.0,
+        80.0,
+        100.0,
+        120.0,
+        150.0,
+        180.0,
+        "+Inf",
+    ),
+)
 
 
 class TransactionRestServlet(RestServlet):
@@ -107,10 +180,10 @@ class RoomStateEventRestServlet(TransactionRestServlet):
         self.auth = hs.get_auth()
 
     def register(self, http_server: HttpServer) -> None:
-        # /room/$roomid/state/$eventtype
+        # /rooms/$roomid/state/$eventtype
         no_state_key = "/rooms/(?P<room_id>[^/]*)/state/(?P<event_type>[^/]*)$"
 
-        # /room/$roomid/state/$eventtype/$statekey
+        # /rooms/$roomid/state/$eventtype/$statekey
         state_key = (
             "/rooms/(?P<room_id>[^/]*)/state/"
             "(?P<event_type>[^/]*)/(?P<state_key>[^/]*)$"
@@ -141,6 +214,7 @@ class RoomStateEventRestServlet(TransactionRestServlet):
             self.__class__.__name__,
         )
 
+    @cancellable
     def on_GET_no_state_key(
         self, request: SynapseRequest, room_id: str, event_type: str
     ) -> Awaitable[Tuple[int, JsonDict]]:
@@ -151,6 +225,7 @@ class RoomStateEventRestServlet(TransactionRestServlet):
     ) -> Awaitable[Tuple[int, JsonDict]]:
         return self.on_PUT(request, room_id, event_type, "")
 
+    @cancellable
     async def on_GET(
         self, request: SynapseRequest, room_id: str, event_type: str, state_key: str
     ) -> Tuple[int, JsonDict]:
@@ -161,7 +236,7 @@ class RoomStateEventRestServlet(TransactionRestServlet):
 
         msg_handler = self.message_handler
         data = await msg_handler.get_room_data(
-            user_id=requester.user.to_string(),
+            requester=requester,
             room_id=room_id,
             event_type=event_type,
             state_key=state_key,
@@ -194,15 +269,9 @@ class RoomStateEventRestServlet(TransactionRestServlet):
 
         content = parse_json_object_from_request(request)
 
-        event_dict = {
-            "type": event_type,
-            "content": content,
-            "room_id": room_id,
-            "sender": requester.user.to_string(),
-        }
-
-        if state_key is not None:
-            event_dict["state_key"] = state_key
+        origin_server_ts = None
+        if requester.app_service:
+            origin_server_ts = parse_integer(request, "ts")
 
         try:
             if event_type == EventTypes.Member:
@@ -213,8 +282,22 @@ class RoomStateEventRestServlet(TransactionRestServlet):
                     room_id=room_id,
                     action=membership,
                     content=content,
+                    origin_server_ts=origin_server_ts,
                 )
             else:
+                event_dict: JsonDict = {
+                    "type": event_type,
+                    "content": content,
+                    "room_id": room_id,
+                    "sender": requester.user.to_string(),
+                }
+
+                if state_key is not None:
+                    event_dict["state_key"] = state_key
+
+                if origin_server_ts is not None:
+                    event_dict["origin_server_ts"] = origin_server_ts
+
                 (
                     event,
                     _,
@@ -259,10 +342,10 @@ class RoomSendEventRestServlet(TransactionRestServlet):
             "sender": requester.user.to_string(),
         }
 
-        # Twisted will have processed the args by now.
-        assert request.args is not None
-        if b"ts" in request.args and requester.app_service:
-            event_dict["origin_server_ts"] = parse_integer(request, "ts", 0)
+        if requester.app_service:
+            origin_server_ts = parse_integer(request, "ts")
+            if origin_server_ts is not None:
+                event_dict["origin_server_ts"] = origin_server_ts
 
         try:
             (
@@ -313,12 +396,7 @@ class JoinRoomAliasServlet(ResolveRoomIdMixin, TransactionRestServlet):
     ) -> Tuple[int, JsonDict]:
         requester = await self.auth.get_user_by_req(request, allow_guest=True)
 
-        try:
-            content = parse_json_object_from_request(request)
-        except Exception:
-            # Turns out we used to ignore the body entirely, and some clients
-            # cheekily send invalid bodies.
-            content = {}
+        content = parse_json_object_from_request(request, allow_empty_body=True)
 
         # twisted.web.server.Request.args is incorrectly defined as Optional[Any]
         args: Dict[bytes, List[bytes]] = request.args  # type: ignore
@@ -479,6 +557,7 @@ class RoomMemberListRestServlet(RestServlet):
         self.auth = hs.get_auth()
         self.store = hs.get_datastores().main
 
+    @cancellable
     async def on_GET(
         self, request: SynapseRequest, room_id: str
     ) -> Tuple[int, JsonDict]:
@@ -505,7 +584,7 @@ class RoomMemberListRestServlet(RestServlet):
 
         events = await handler.get_state_events(
             room_id=room_id,
-            user_id=requester.user.to_string(),
+            requester=requester,
             at_token=at_token,
             state_filter=StateFilter.from_types([(EventTypes.Member, None)]),
         )
@@ -551,6 +630,7 @@ class RoomMessageListRestServlet(RestServlet):
     def __init__(self, hs: "HomeServer"):
         super().__init__()
         self._hs = hs
+        self.clock = hs.get_clock()
         self.pagination_handler = hs.get_pagination_handler()
         self.auth = hs.get_auth()
         self.store = hs.get_datastores().main
@@ -558,6 +638,18 @@ class RoomMessageListRestServlet(RestServlet):
     async def on_GET(
         self, request: SynapseRequest, room_id: str
     ) -> Tuple[int, JsonDict]:
+        processing_start_time = self.clock.time_msec()
+        # Fire off and hope that we get a result by the end.
+        #
+        # We're using the mypy type ignore comment because the `@cached`
+        # decorator on `get_number_joined_users_in_room` doesn't play well with
+        # the type system. Maybe in the future, it can use some ParamSpec
+        # wizardry to fix it up.
+        room_member_count_deferred = run_in_background(  # type: ignore[call-arg]
+            self.store.get_number_joined_users_in_room,
+            room_id,  # type: ignore[arg-type]
+        )
+
         requester = await self.auth.get_user_by_req(request, allow_guest=True)
         pagination_config = await PaginationConfig.from_request(
             self.store, request, default_limit=10
@@ -588,6 +680,12 @@ class RoomMessageListRestServlet(RestServlet):
             event_filter=event_filter,
         )
 
+        processing_end_time = self.clock.time_msec()
+        room_member_count = await make_deferred_yieldable(room_member_count_deferred)
+        messsages_response_timer.labels(
+            room_size=_RoomSize.from_member_count(room_member_count)
+        ).observe((processing_end_time - processing_start_time) / 1000)
+
         return 200, msgs
 
 
@@ -600,6 +698,7 @@ class RoomStateRestServlet(RestServlet):
         self.message_handler = hs.get_message_handler()
         self.auth = hs.get_auth()
 
+    @cancellable
     async def on_GET(
         self, request: SynapseRequest, room_id: str
     ) -> Tuple[int, List[JsonDict]]:
@@ -607,8 +706,7 @@ class RoomStateRestServlet(RestServlet):
         # Get all the current state for this room
         events = await self.message_handler.get_state_events(
             room_id=room_id,
-            user_id=requester.user.to_string(),
-            is_guest=requester.is_guest,
+            requester=requester,
         )
         return 200, events
 
@@ -627,7 +725,9 @@ class RoomInitialSyncRestServlet(RestServlet):
         self, request: SynapseRequest, room_id: str
     ) -> Tuple[int, JsonDict]:
         requester = await self.auth.get_user_by_req(request, allow_guest=True)
-        pagination_config = await PaginationConfig.from_request(self.store, request)
+        pagination_config = await PaginationConfig.from_request(
+            self.store, request, default_limit=10
+        )
         content = await self.initial_sync_handler.room_initial_sync(
             room_id=room_id, requester=requester, pagin_config=pagination_config
         )
@@ -643,17 +743,58 @@ class RoomEventServlet(RestServlet):
         super().__init__()
         self.clock = hs.get_clock()
         self._store = hs.get_datastores().main
+        self._state = hs.get_state_handler()
+        self._storage_controllers = hs.get_storage_controllers()
         self.event_handler = hs.get_event_handler()
         self._event_serializer = hs.get_event_client_serializer()
+        self._relations_handler = hs.get_relations_handler()
         self.auth = hs.get_auth()
+        self.content_keep_ms = hs.config.server.redaction_retention_period
+        self.msc2815_enabled = hs.config.experimental.msc2815_enabled
 
     async def on_GET(
         self, request: SynapseRequest, room_id: str, event_id: str
     ) -> Tuple[int, JsonDict]:
         requester = await self.auth.get_user_by_req(request, allow_guest=True)
+
+        include_unredacted_content = self.msc2815_enabled and (
+            parse_string(
+                request,
+                "fi.mau.msc2815.include_unredacted_content",
+                allowed_values=("true", "false"),
+            )
+            == "true"
+        )
+        if include_unredacted_content and not await self.auth.is_server_admin(
+            requester
+        ):
+            power_level_event = (
+                await self._storage_controllers.state.get_current_state_event(
+                    room_id, EventTypes.PowerLevels, ""
+                )
+            )
+
+            auth_events = {}
+            if power_level_event:
+                auth_events[(EventTypes.PowerLevels, "")] = power_level_event
+
+            redact_level = event_auth.get_named_level(auth_events, "redact", 50)
+            user_level = event_auth.get_user_power_level(
+                requester.user.to_string(), auth_events
+            )
+            if user_level < redact_level:
+                raise SynapseError(
+                    403,
+                    "You don't have permission to view redacted events in this room.",
+                    errcode=Codes.FORBIDDEN,
+                )
+
         try:
             event = await self.event_handler.get_event(
-                requester.user, room_id, event_id
+                requester.user,
+                room_id,
+                event_id,
+                show_redacted=include_unredacted_content,
             )
         except AuthError:
             # This endpoint is supposed to return a 404 when the requester does
@@ -662,14 +803,21 @@ class RoomEventServlet(RestServlet):
             raise SynapseError(404, "Event not found.", errcode=Codes.NOT_FOUND)
 
         if event:
+            if include_unredacted_content and await self._store.have_censored_event(
+                event_id
+            ):
+                raise UnredactedContentDeletedError(self.content_keep_ms)
+
             # Ensure there are bundled aggregations available.
-            aggregations = await self._store.get_bundled_aggregations(
+            aggregations = await self._relations_handler.get_bundled_aggregations(
                 [event], requester.user.to_string()
             )
 
             time_now = self.clock.time_msec()
+            # per MSC2676, /rooms/{roomId}/event/{eventId}, should return the
+            # *original* event, rather than the edited version
             event_dict = self._event_serializer.serialize_event(
-                event, time_now, bundle_aggregations=aggregations
+                event, time_now, bundle_aggregations=aggregations, apply_edits=False
             )
             return 200, event_dict
 
@@ -799,14 +947,18 @@ class RoomMembershipRestServlet(TransactionRestServlet):
         }:
             raise AuthError(403, "Guest access not allowed")
 
-        try:
-            content = parse_json_object_from_request(request)
-        except Exception:
-            # Turns out we used to ignore the body entirely, and some clients
-            # cheekily send invalid bodies.
-            content = {}
+        content = parse_json_object_from_request(request, allow_empty_body=True)
 
-        if membership_action == "invite" and self._has_3pid_invite_keys(content):
+        if membership_action == "invite" and all(
+            key in content for key in ("medium", "address")
+        ):
+            if not all(key in content for key in ("id_server", "id_access_token")):
+                raise SynapseError(
+                    HTTPStatus.BAD_REQUEST,
+                    "`id_server` and `id_access_token` are required when doing 3pid invite",
+                    Codes.MISSING_PARAM,
+                )
+
             try:
                 await self.room_member_handler.do_3pid_invite(
                     room_id,
@@ -816,7 +968,7 @@ class RoomMembershipRestServlet(TransactionRestServlet):
                     content["id_server"],
                     requester,
                     txn_id,
-                    content.get("id_access_token"),
+                    content["id_access_token"],
                 )
             except ShadowBanError:
                 # Pretend the request succeeded.
@@ -853,12 +1005,6 @@ class RoomMembershipRestServlet(TransactionRestServlet):
 
         return 200, return_value
 
-    def _has_3pid_invite_keys(self, content: JsonDict) -> bool:
-        for key in {"id_server", "medium", "address"}:
-            if key not in content:
-                return False
-        return True
-
     def on_PUT(
         self, request: SynapseRequest, room_id: str, membership_action: str, txn_id: str
     ) -> Awaitable[Tuple[int, JsonDict]]:
@@ -874,6 +1020,8 @@ class RoomRedactEventRestServlet(TransactionRestServlet):
         super().__init__(hs)
         self.event_creation_handler = hs.get_event_creation_handler()
         self.auth = hs.get_auth()
+        self._relation_handler = hs.get_relations_handler()
+        self._msc3912_enabled = hs.config.experimental.msc3912_enabled
 
     def register(self, http_server: HttpServer) -> None:
         PATTERNS = "/rooms/(?P<room_id>[^/]*)/redact/(?P<event_id>[^/]*)"
@@ -890,20 +1038,46 @@ class RoomRedactEventRestServlet(TransactionRestServlet):
         content = parse_json_object_from_request(request)
 
         try:
-            (
-                event,
-                _,
-            ) = await self.event_creation_handler.create_and_send_nonmember_event(
-                requester,
-                {
-                    "type": EventTypes.Redaction,
-                    "content": content,
-                    "room_id": room_id,
-                    "sender": requester.user.to_string(),
-                    "redacts": event_id,
-                },
-                txn_id=txn_id,
-            )
+            with_relations = None
+            if self._msc3912_enabled and "org.matrix.msc3912.with_relations" in content:
+                with_relations = content["org.matrix.msc3912.with_relations"]
+                del content["org.matrix.msc3912.with_relations"]
+
+            # Check if there's an existing event for this transaction now (even though
+            # create_and_send_nonmember_event also does it) because, if there's one,
+            # then we want to skip the call to redact_events_related_to.
+            event = None
+            if txn_id:
+                event = await self.event_creation_handler.get_event_from_transaction(
+                    requester, txn_id, room_id
+                )
+
+            if event is None:
+                (
+                    event,
+                    _,
+                ) = await self.event_creation_handler.create_and_send_nonmember_event(
+                    requester,
+                    {
+                        "type": EventTypes.Redaction,
+                        "content": content,
+                        "room_id": room_id,
+                        "sender": requester.user.to_string(),
+                        "redacts": event_id,
+                    },
+                    txn_id=txn_id,
+                )
+
+                if with_relations:
+                    run_as_background_process(
+                        "redact_related_events",
+                        self._relation_handler.redact_events_related_to,
+                        requester=requester,
+                        event_id=event_id,
+                        initial_redaction_event=event,
+                        relation_types=with_relations,
+                    )
+
             event_id = event.event_id
         except ShadowBanError:
             event_id = "$" + random_string(43)
@@ -1100,17 +1274,14 @@ class TimestampLookupRestServlet(RestServlet):
     `dir` can be `f` or `b` to indicate forwards and backwards in time from the
     given timestamp.
 
-    GET /_matrix/client/unstable/org.matrix.msc3030/rooms/<roomID>/timestamp_to_event?ts=<timestamp>&dir=<direction>
+    GET /_matrix/client/v1/rooms/<roomID>/timestamp_to_event?ts=<timestamp>&dir=<direction>
     {
         "event_id": ...
     }
     """
 
     PATTERNS = (
-        re.compile(
-            "^/_matrix/client/unstable/org.matrix.msc3030"
-            "/rooms/(?P<room_id>[^/]*)/timestamp_to_event$"
-        ),
+        re.compile("^/_matrix/client/v1/rooms/(?P<room_id>[^/]*)/timestamp_to_event$"),
     )
 
     def __init__(self, hs: "HomeServer"):
@@ -1123,7 +1294,7 @@ class TimestampLookupRestServlet(RestServlet):
         self, request: SynapseRequest, room_id: str
     ) -> Tuple[int, JsonDict]:
         requester = await self._auth.get_user_by_req(request)
-        await self._auth.check_user_in_room(room_id, requester.user.to_string())
+        await self._auth.check_user_in_room_or_world_readable(room_id, requester)
 
         timestamp = parse_integer(request, "ts", required=True)
         direction = parse_string(request, "dir", default="f", allowed_values=["f", "b"])
@@ -1142,12 +1313,7 @@ class TimestampLookupRestServlet(RestServlet):
 
 
 class RoomHierarchyRestServlet(RestServlet):
-    PATTERNS = (
-        re.compile(
-            "^/_matrix/client/(v1|unstable/org.matrix.msc2946)"
-            "/rooms/(?P<room_id>[^/]*)/hierarchy$"
-        ),
-    )
+    PATTERNS = (re.compile("^/_matrix/client/v1/rooms/(?P<room_id>[^/]*)/hierarchy$"),)
 
     def __init__(self, hs: "HomeServer"):
         super().__init__()
@@ -1219,9 +1385,7 @@ class RoomSummaryRestServlet(ResolveRoomIdMixin, RestServlet):
         )
 
 
-def register_servlets(
-    hs: "HomeServer", http_server: HttpServer, is_worker: bool = False
-) -> None:
+def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
     RoomStateEventRestServlet(hs).register(http_server)
     RoomMemberListRestServlet(hs).register(http_server)
     JoinedRoomMemberListRestServlet(hs).register(http_server)
@@ -1242,11 +1406,10 @@ def register_servlets(
     RoomAliasListServlet(hs).register(http_server)
     SearchRestServlet(hs).register(http_server)
     RoomCreateRestServlet(hs).register(http_server)
-    if hs.config.experimental.msc3030_enabled:
-        TimestampLookupRestServlet(hs).register(http_server)
+    TimestampLookupRestServlet(hs).register(http_server)
 
     # Some servlets only get registered for the main process.
-    if not is_worker:
+    if hs.config.worker.worker_app is None:
         RoomForgetRestServlet(hs).register(http_server)
 
 

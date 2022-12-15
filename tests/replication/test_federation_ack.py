@@ -25,8 +25,9 @@ from tests.unittest import HomeserverTestCase
 class FederationAckTestCase(HomeserverTestCase):
     def default_config(self) -> dict:
         config = super().default_config()
-        config["worker_app"] = "synapse.app.federation_sender"
-        config["send_federation"] = False
+        config["worker_app"] = "synapse.app.generic_worker"
+        config["worker_name"] = "federation_sender1"
+        config["federation_sender_instances"] = ["federation_sender1"]
         return config
 
     def make_homeserver(self, reactor, clock):
@@ -48,7 +49,7 @@ class FederationAckTestCase(HomeserverTestCase):
         transport, rather than assuming that the implementation has a
         ReplicationCommandHandler.
         """
-        rch = self.hs.get_tcp_replication()
+        rch = self.hs.get_replication_command_handler()
 
         # wire up the ReplicationCommandHandler to a mock connection, which needs
         # to implement IReplicationConnection. (Note that Mock doesn't understand

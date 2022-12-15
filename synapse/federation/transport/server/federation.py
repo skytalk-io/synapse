@@ -24,9 +24,9 @@ from typing import (
     Union,
 )
 
-from matrix_common.versionstring import get_distribution_version_string
 from typing_extensions import Literal
 
+from synapse.api.constants import EduTypes
 from synapse.api.errors import Codes, SynapseError
 from synapse.api.room_versions import RoomVersions
 from synapse.api.urls import FEDERATION_UNSTABLE_PREFIX, FEDERATION_V2_PREFIX
@@ -41,6 +41,7 @@ from synapse.http.servlet import (
     parse_strings_from_args,
 )
 from synapse.types import JsonDict
+from synapse.util import SYNAPSE_VERSION
 from synapse.util.ratelimitutils import FederationRateLimiter
 
 if TYPE_CHECKING:
@@ -108,7 +109,10 @@ class FederationSendServlet(BaseFederationServerServlet):
             )
 
             if issue_8631_logger.isEnabledFor(logging.DEBUG):
-                DEVICE_UPDATE_EDUS = ["m.device_list_update", "m.signing_key_update"]
+                DEVICE_UPDATE_EDUS = [
+                    EduTypes.DEVICE_LIST_UPDATE,
+                    EduTypes.SIGNING_KEY_UPDATE,
+                ]
                 device_list_updates = [
                     edu.get("content", {})
                     for edu in transaction_data.get("edus", [])
@@ -160,7 +164,7 @@ class FederationStateV1Servlet(BaseFederationServerServlet):
         return await self.handler.on_room_state_request(
             origin,
             room_id,
-            parse_string_from_args(query, "event_id", None, required=False),
+            parse_string_from_args(query, "event_id", None, required=True),
         )
 
 
@@ -214,14 +218,13 @@ class FederationTimestampLookupServlet(BaseFederationServerServlet):
     `dir` can be `f` or `b` to indicate forwards and backwards in time from the
     given timestamp.
 
-    GET /_matrix/federation/unstable/org.matrix.msc3030/timestamp_to_event/<roomID>?ts=<timestamp>&dir=<direction>
+    GET /_matrix/federation/v1/timestamp_to_event/<roomID>?ts=<timestamp>&dir=<direction>
     {
         "event_id": ...
     }
     """
 
     PATH = "/timestamp_to_event/(?P<room_id>[^/]*)/?"
-    PREFIX = FEDERATION_UNSTABLE_PREFIX + "/org.matrix.msc3030"
 
     async def on_GET(
         self,
@@ -485,7 +488,7 @@ class FederationV2InviteServlet(BaseFederationServerServlet):
 
         room_version = content["room_version"]
         event = content["event"]
-        invite_room_state = content["invite_room_state"]
+        invite_room_state = content.get("invite_room_state", [])
 
         # Synapse expects invite_room_state to be in unsigned, as it is in v1
         # API
@@ -495,6 +498,11 @@ class FederationV2InviteServlet(BaseFederationServerServlet):
         result = await self.handler.on_invite_request(
             origin, event, room_version_id=room_version
         )
+
+        # We only store invite_room_state for internal use, so remove it before
+        # returning the event to the remote homeserver.
+        result["event"].get("unsigned", {}).pop("invite_room_state", None)
+
         return 200, result
 
 
@@ -545,8 +553,7 @@ class FederationClientKeysClaimServlet(BaseFederationServerServlet):
 
 
 class FederationGetMissingEventsServlet(BaseFederationServerServlet):
-    # TODO(paul): Why does this path alone end with "/?" optional?
-    PATH = "/get_missing_events/(?P<room_id>[^/]*)/?"
+    PATH = "/get_missing_events/(?P<room_id>[^/]*)"
 
     async def on_POST(
         self,
@@ -618,7 +625,7 @@ class FederationVersionServlet(BaseFederationServlet):
             {
                 "server": {
                     "name": "Synapse",
-                    "version": get_distribution_version_string("matrix-synapse"),
+                    "version": SYNAPSE_VERSION,
                 }
             },
         )
@@ -648,10 +655,6 @@ class FederationRoomHierarchyServlet(BaseFederationServlet):
         return 200, await self.handler.get_federation_hierarchy(
             origin, room_id, suggested_only
         )
-
-
-class FederationRoomHierarchyUnstableServlet(FederationRoomHierarchyServlet):
-    PREFIX = FEDERATION_UNSTABLE_PREFIX + "/org.matrix.msc2946"
 
 
 class RoomComplexityServlet(BaseFederationServlet):
@@ -752,7 +755,6 @@ FEDERATION_SERVLET_CLASSES: Tuple[Type[BaseFederationServlet], ...] = (
     FederationVersionServlet,
     RoomComplexityServlet,
     FederationRoomHierarchyServlet,
-    FederationRoomHierarchyUnstableServlet,
     FederationV1SendKnockServlet,
     FederationMakeKnockServlet,
     FederationAccountStatusServlet,

@@ -22,11 +22,9 @@ from typing import (
     BinaryIO,
     Callable,
     Dict,
-    Iterable,
     List,
     Mapping,
     Optional,
-    Sequence,
     Tuple,
     Union,
 )
@@ -44,8 +42,10 @@ from twisted.internet import defer, error as twisted_error, protocol, ssl
 from twisted.internet.address import IPv4Address, IPv6Address
 from twisted.internet.interfaces import (
     IAddress,
+    IDelayedCall,
     IHostResolution,
     IReactorPluggableNameResolver,
+    IReactorTime,
     IResolutionReceiver,
     ITCPTransport,
 )
@@ -72,6 +72,7 @@ from twisted.web.iweb import (
 from synapse.api.errors import Codes, HttpResponseException, SynapseError
 from synapse.http import QuieterFileBodyProducer, RequestTimedOutError, redact_uri
 from synapse.http.proxyagent import ProxyAgent
+from synapse.http.types import QueryParams
 from synapse.logging.context import make_deferred_yieldable
 from synapse.logging.opentracing import set_tag, start_active_span, tags
 from synapse.types import ISynapseReactor
@@ -88,18 +89,29 @@ incoming_responses_counter = Counter(
     "synapse_http_client_responses", "", ["method", "code"]
 )
 
-# the type of the headers list, to be passed to the t.w.h.Headers.
-# Actually we can mix str and bytes keys, but Mapping treats 'key' as invariant so
-# we simplify.
+# the type of the headers map, to be passed to the t.w.h.Headers.
+#
+# The actual type accepted by Twisted is
+#   Mapping[Union[str, bytes], Sequence[Union[str, bytes]] ,
+# allowing us to mix and match str and bytes freely. However: any str is also a
+# Sequence[str]; passing a header string value which is a
+# standalone str is interpreted as a sequence of 1-codepoint strings. This is a disastrous footgun.
+# We use a narrower value type (RawHeaderValue) to avoid this footgun.
+#
+# We also simplify the keys to be either all str or all bytes. This helps because
+# Dict[K, V] is invariant in K (and indeed V).
 RawHeaders = Union[Mapping[str, "RawHeaderValue"], Mapping[bytes, "RawHeaderValue"]]
 
 # the value actually has to be a List, but List is invariant so we can't specify that
 # the entries can either be Lists or bytes.
-RawHeaderValue = Sequence[Union[str, bytes]]
-
-# the type of the query params, to be passed into `urlencode`
-QueryParamValue = Union[str, bytes, Iterable[Union[str, bytes]]]
-QueryParams = Union[Mapping[str, QueryParamValue], Mapping[bytes, QueryParamValue]]
+RawHeaderValue = Union[
+    List[str],
+    List[bytes],
+    List[Union[str, bytes]],
+    Tuple[str, ...],
+    Tuple[bytes, ...],
+    Tuple[Union[str, bytes], ...],
+]
 
 
 def check_against_blacklist(
@@ -125,13 +137,15 @@ def check_against_blacklist(
 _EPSILON = 0.00000001
 
 
-def _make_scheduler(reactor):
+def _make_scheduler(
+    reactor: IReactorTime,
+) -> Callable[[Callable[[], object]], IDelayedCall]:
     """Makes a schedular suitable for a Cooperator using the given reactor.
 
     (This is effectively just a copy from `twisted.internet.task`)
     """
 
-    def _scheduler(x):
+    def _scheduler(x: Callable[[], object]) -> IDelayedCall:
         return reactor.callLater(_EPSILON, x)
 
     return _scheduler
@@ -352,7 +366,7 @@ class SimpleHttpClient:
         # XXX: The justification for using the cache factor here is that larger instances
         # will need both more cache and more connections.
         # Still, this should probably be a separate dial
-        pool.maxPersistentPerHost = max((100 * hs.config.caches.global_factor, 5))
+        pool.maxPersistentPerHost = max(int(100 * hs.config.caches.global_factor), 5)
         pool.cachedConnectionTimeout = 2 * 60
 
         self.agent: IAgent = ProxyAgent(
@@ -779,7 +793,7 @@ class SimpleHttpClient:
         )
 
 
-def _timeout_to_request_timed_out_error(f: Failure):
+def _timeout_to_request_timed_out_error(f: Failure) -> Failure:
     if f.check(twisted_error.TimeoutError, twisted_error.ConnectingCancelledError):
         # The TCP connection has its own timeout (set by the 'connectTimeout' param
         # on the Agent), which raises twisted_error.TimeoutError exception.
@@ -813,7 +827,7 @@ class _DiscardBodyWithMaxSizeProtocol(protocol.Protocol):
     def __init__(self, deferred: defer.Deferred):
         self.deferred = deferred
 
-    def _maybe_fail(self):
+    def _maybe_fail(self) -> None:
         """
         Report a max size exceed error and disconnect the first time this is called.
         """
@@ -911,7 +925,7 @@ def read_body_with_max_size(
     return d
 
 
-def encode_query_args(args: Optional[Mapping[str, Union[str, List[str]]]]) -> bytes:
+def encode_query_args(args: Optional[QueryParams]) -> bytes:
     """
     Encodes a map of query arguments to bytes which can be appended to a URL.
 
@@ -924,13 +938,7 @@ def encode_query_args(args: Optional[Mapping[str, Union[str, List[str]]]]) -> by
     if args is None:
         return b""
 
-    encoded_args = {}
-    for k, vs in args.items():
-        if isinstance(vs, str):
-            vs = [vs]
-        encoded_args[k] = [v.encode("utf8") for v in vs]
-
-    query_str = urllib.parse.urlencode(encoded_args, True)
+    query_str = urllib.parse.urlencode(args, True)
 
     return query_str.encode("utf8")
 
@@ -943,12 +951,12 @@ class InsecureInterceptableContextFactory(ssl.ContextFactory):
     Do not use this since it allows an attacker to intercept your communications.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._context = SSL.Context(SSL.SSLv23_METHOD)
         self._context.set_verify(VERIFY_NONE, lambda *_: False)
 
     def getContext(self, hostname=None, port=None):
         return self._context
 
-    def creatorForNetloc(self, hostname, port):
+    def creatorForNetloc(self, hostname: bytes, port: int):
         return self

@@ -15,12 +15,17 @@ import logging
 from typing import Iterable, Optional
 
 from canonicaljson import encode_canonical_json
+from parameterized import parameterized
 
+from synapse.api.constants import ReceiptTypes
 from synapse.api.room_versions import RoomVersions
 from synapse.events import FrozenEvent, _EventInternalMetadata, make_event_from_dict
 from synapse.handlers.room import RoomEventSource
-from synapse.replication.slave.storage.events import SlavedEventStore
-from synapse.storage.databases.main.event_push_actions import NotifCounts
+from synapse.storage.databases.main.event_push_actions import (
+    NotifCounts,
+    RoomNotifCounts,
+)
+from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.storage.roommember import GetRoomsForUserWithStreamOrdering, RoomsForUser
 from synapse.types import PersistedEventPosition
 
@@ -53,9 +58,9 @@ def patch__eq__(cls):
     return unpatch
 
 
-class SlavedEventStoreTestCase(BaseSlavedStoreTestCase):
+class EventsWorkerStoreTestCase(BaseSlavedStoreTestCase):
 
-    STORE_TYPE = SlavedEventStore
+    STORE_TYPE = EventsWorkerStore
 
     def setUp(self):
         # Patch up the equality operator for events so that we can check
@@ -138,6 +143,7 @@ class SlavedEventStoreTestCase(BaseSlavedStoreTestCase):
         self.persist(type="m.room.create", key="", creator=USER_ID)
         self.check("get_invited_rooms_for_local_user", [USER_ID_2], [])
         event = self.persist(type="m.room.member", key=USER_ID_2, membership="invite")
+        assert event.internal_metadata.stream_ordering is not None
 
         self.replicate()
 
@@ -156,18 +162,29 @@ class SlavedEventStoreTestCase(BaseSlavedStoreTestCase):
             ],
         )
 
-    def test_push_actions_for_user(self):
+    @parameterized.expand([(True,), (False,)])
+    def test_push_actions_for_user(self, send_receipt: bool):
         self.persist(type="m.room.create", key="", creator=USER_ID)
-        self.persist(type="m.room.join", key=USER_ID, membership="join")
+        self.persist(type="m.room.member", key=USER_ID, membership="join")
         self.persist(
-            type="m.room.join", sender=USER_ID, key=USER_ID_2, membership="join"
+            type="m.room.member", sender=USER_ID, key=USER_ID_2, membership="join"
         )
         event1 = self.persist(type="m.room.message", msgtype="m.text", body="hello")
         self.replicate()
+
+        if send_receipt:
+            self.get_success(
+                self.master_store.insert_receipt(
+                    ROOM_ID, ReceiptTypes.READ, USER_ID_2, [event1.event_id], None, {}
+                )
+            )
+
         self.check(
             "get_unread_event_push_actions_by_room_for_user",
-            [ROOM_ID, USER_ID_2, event1.event_id],
-            NotifCounts(highlight_count=0, unread_count=0, notify_count=0),
+            [ROOM_ID, USER_ID_2],
+            RoomNotifCounts(
+                NotifCounts(highlight_count=0, unread_count=0, notify_count=0), {}
+            ),
         )
 
         self.persist(
@@ -179,8 +196,10 @@ class SlavedEventStoreTestCase(BaseSlavedStoreTestCase):
         self.replicate()
         self.check(
             "get_unread_event_push_actions_by_room_for_user",
-            [ROOM_ID, USER_ID_2, event1.event_id],
-            NotifCounts(highlight_count=0, unread_count=0, notify_count=1),
+            [ROOM_ID, USER_ID_2],
+            RoomNotifCounts(
+                NotifCounts(highlight_count=0, unread_count=0, notify_count=1), {}
+            ),
         )
 
         self.persist(
@@ -194,8 +213,10 @@ class SlavedEventStoreTestCase(BaseSlavedStoreTestCase):
         self.replicate()
         self.check(
             "get_unread_event_push_actions_by_room_for_user",
-            [ROOM_ID, USER_ID_2, event1.event_id],
-            NotifCounts(highlight_count=1, unread_count=0, notify_count=2),
+            [ROOM_ID, USER_ID_2],
+            RoomNotifCounts(
+                NotifCounts(highlight_count=1, unread_count=0, notify_count=2), {}
+            ),
         )
 
     def test_get_rooms_for_user_with_stream_ordering(self):
@@ -210,6 +231,7 @@ class SlavedEventStoreTestCase(BaseSlavedStoreTestCase):
         j2 = self.persist(
             type="m.room.member", sender=USER_ID_2, key=USER_ID_2, membership="join"
         )
+        assert j2.internal_metadata.stream_ordering is not None
         self.replicate()
 
         expected_pos = PersistedEventPosition(
@@ -262,13 +284,16 @@ class SlavedEventStoreTestCase(BaseSlavedStoreTestCase):
         )
         msg, msgctx = self.build_event()
         self.get_success(
-            self.storage.persistence.persist_events([(j2, j2ctx), (msg, msgctx)])
+            self._storage_controllers.persistence.persist_events(
+                [(j2, j2ctx), (msg, msgctx)]
+            )
         )
         self.replicate()
+        assert j2.internal_metadata.stream_ordering is not None
 
         event_source = RoomEventSource(self.hs)
         event_source.store = self.slaved_store
-        current_token = self.get_success(event_source.get_current_key())
+        current_token = event_source.get_current_key()
 
         # gradually stream out the replication
         while repl_transport.buffer:
@@ -277,7 +302,7 @@ class SlavedEventStoreTestCase(BaseSlavedStoreTestCase):
             self.pump(0)
 
             prev_token = current_token
-            current_token = self.get_success(event_source.get_current_key())
+            current_token = event_source.get_current_key()
 
             # attempt to replicate the behaviour of the sync handler.
             #
@@ -314,21 +339,23 @@ class SlavedEventStoreTestCase(BaseSlavedStoreTestCase):
 
     event_id = 0
 
-    def persist(self, backfill=False, **kwargs):
+    def persist(self, backfill=False, **kwargs) -> FrozenEvent:
         """
         Returns:
-            synapse.events.FrozenEvent: The event that was persisted.
+            The event that was persisted.
         """
         event, context = self.build_event(**kwargs)
 
         if backfill:
             self.get_success(
-                self.storage.persistence.persist_events(
+                self._storage_controllers.persistence.persist_events(
                     [(event, context)], backfilled=True
                 )
             )
         else:
-            self.get_success(self.storage.persistence.persist_event(event, context))
+            self.get_success(
+                self._storage_controllers.persistence.persist_event(event, context)
+            )
 
         return event
 
@@ -389,6 +416,7 @@ class SlavedEventStoreTestCase(BaseSlavedStoreTestCase):
                 event.event_id,
                 {user_id: actions for user_id, actions in push_actions},
                 False,
+                "main",
             )
         )
         return event, context

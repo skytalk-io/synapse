@@ -17,8 +17,10 @@ from typing import (
     TYPE_CHECKING,
     Collection,
     Dict,
+    FrozenSet,
     Iterable,
     List,
+    Mapping,
     Optional,
     Set,
     Tuple,
@@ -27,9 +29,9 @@ from typing import (
 )
 
 import attr
-from frozendict import frozendict
 
-from synapse.api.constants import RelationTypes
+from synapse.api.constants import MAIN_TIMELINE, RelationTypes
+from synapse.api.errors import SynapseError
 from synapse.events import EventBase
 from synapse.storage._base import SQLBaseStore
 from synapse.storage.database import (
@@ -40,44 +42,46 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.stream import generate_pagination_where_clause
 from synapse.storage.engines import PostgresEngine
-from synapse.storage.relations import AggregationPaginationToken, PaginationChunk
-from synapse.types import JsonDict, RoomStreamToken, StreamToken
+from synapse.types import JsonDict, RoomStreamToken, StreamKeyType, StreamToken
 from synapse.util.caches.descriptors import cached, cachedList
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
-    from synapse.storage.databases.main import DataStore
 
 logger = logging.getLogger(__name__)
 
 
 @attr.s(slots=True, frozen=True, auto_attribs=True)
-class _ThreadAggregation:
-    # The latest event in the thread.
-    latest_event: EventBase
-    # The latest edit to the latest event in the thread.
-    latest_edit: Optional[EventBase]
-    # The total number of events in the thread.
-    count: int
-    # True if the current user has sent an event to the thread.
-    current_user_participated: bool
+class ThreadsNextBatch:
+    topological_ordering: int
+    stream_ordering: int
+
+    def __str__(self) -> str:
+        return f"{self.topological_ordering}_{self.stream_ordering}"
+
+    @classmethod
+    def from_string(cls, string: str) -> "ThreadsNextBatch":
+        """
+        Creates a ThreadsNextBatch from its textual representation.
+        """
+        try:
+            keys = (int(s) for s in string.split("_"))
+            return cls(*keys)
+        except Exception:
+            raise SynapseError(400, "Invalid threads token")
 
 
-@attr.s(slots=True, auto_attribs=True)
-class BundledAggregations:
+@attr.s(slots=True, frozen=True, auto_attribs=True)
+class _RelatedEvent:
     """
-    The bundled aggregations for an event.
-
-    Some values require additional processing during serialization.
+    Contains enough information about a related event in order to properly filter
+    events from ignored users.
     """
 
-    annotations: Optional[JsonDict] = None
-    references: Optional[JsonDict] = None
-    replace: Optional[EventBase] = None
-    thread: Optional[_ThreadAggregation] = None
-
-    def __bool__(self) -> bool:
-        return bool(self.annotations or self.references or self.replace or self.thread)
+    # The event ID of the related event.
+    event_id: str
+    # The sender of the related event.
+    sender: str
 
 
 class RelationsWorkerStore(SQLBaseStore):
@@ -89,29 +93,89 @@ class RelationsWorkerStore(SQLBaseStore):
     ):
         super().__init__(database, db_conn, hs)
 
-        self._msc3440_enabled = hs.config.experimental.msc3440_enabled
+        self.db_pool.updates.register_background_update_handler(
+            "threads_backfill", self._backfill_threads
+        )
 
-    @cached(tree=True)
+    async def _backfill_threads(self, progress: JsonDict, batch_size: int) -> int:
+        """Backfill the threads table."""
+
+        def threads_backfill_txn(txn: LoggingTransaction) -> int:
+            last_thread_id = progress.get("last_thread_id", "")
+
+            # Get the latest event in each thread by topo ordering / stream ordering.
+            #
+            # Note that the MAX(event_id) is needed to abide by the rules of group by,
+            # but doesn't actually do anything since there should only be a single event
+            # ID per topo/stream ordering pair.
+            sql = f"""
+            SELECT room_id, relates_to_id, MAX(topological_ordering), MAX(stream_ordering), MAX(event_id)
+            FROM event_relations
+            INNER JOIN events USING (event_id)
+            WHERE
+                relates_to_id > ? AND
+                relation_type = '{RelationTypes.THREAD}'
+            GROUP BY room_id, relates_to_id
+            ORDER BY relates_to_id
+            LIMIT ?
+            """
+            txn.execute(sql, (last_thread_id, batch_size))
+
+            # No more rows to process.
+            rows = txn.fetchall()
+            if not rows:
+                return 0
+
+            # Insert the rows into the threads table. If a matching thread already exists,
+            # assume it is from a newer event.
+            sql = """
+            INSERT INTO threads (room_id, thread_id, topological_ordering, stream_ordering, latest_event_id)
+            VALUES %s
+            ON CONFLICT (room_id, thread_id)
+            DO NOTHING
+            """
+            if isinstance(txn.database_engine, PostgresEngine):
+                txn.execute_values(sql % ("?",), rows, fetch=False)
+            else:
+                txn.execute_batch(sql % ("(?, ?, ?, ?, ?)",), rows)
+
+            # Mark the progress.
+            self.db_pool.updates._background_update_progress_txn(
+                txn, "threads_backfill", {"last_thread_id": rows[-1][1]}
+            )
+
+            return txn.rowcount
+
+        result = await self.db_pool.runInteraction(
+            "threads_backfill", threads_backfill_txn
+        )
+
+        if not result:
+            await self.db_pool.updates._end_background_update("threads_backfill")
+
+        return result
+
+    @cached(uncached_args=("event",), tree=True)
     async def get_relations_for_event(
         self,
         event_id: str,
+        event: EventBase,
         room_id: str,
         relation_type: Optional[str] = None,
         event_type: Optional[str] = None,
-        aggregation_key: Optional[str] = None,
         limit: int = 5,
         direction: str = "b",
         from_token: Optional[StreamToken] = None,
         to_token: Optional[StreamToken] = None,
-    ) -> PaginationChunk:
+    ) -> Tuple[List[_RelatedEvent], Optional[StreamToken]]:
         """Get a list of relations for an event, ordered by topological ordering.
 
         Args:
             event_id: Fetch events that relate to this event ID.
+            event: The matching EventBase to event_id.
             room_id: The room the event belongs to.
             relation_type: Only fetch events with this relation type, if given.
             event_type: Only fetch events with this event type, if given.
-            aggregation_key: Only fetch events with this aggregation key, if given.
             limit: Only fetch the most recent `limit` events.
             direction: Whether to fetch the most recent first (`"b"`) or the
                 oldest first (`"f"`).
@@ -119,12 +183,21 @@ class RelationsWorkerStore(SQLBaseStore):
             to_token: Fetch rows up to the given token, or up to the end if None.
 
         Returns:
-            List of event IDs that match relations requested. The rows are of
-            the form `{"event_id": "..."}`.
+            A tuple of:
+                A list of related event IDs & their senders.
+
+                The next stream token, if one exists.
         """
+        # We don't use `event_id`, it's there so that we can cache based on
+        # it. The `event_id` must match the `event.event_id`.
+        assert event.event_id == event_id
+
+        # Ensure bad limits aren't being passed in.
+        assert limit >= 0
 
         where_clause = ["relates_to_id = ?", "room_id = ?"]
-        where_args: List[Union[str, int]] = [event_id, room_id]
+        where_args: List[Union[str, int]] = [event.event_id, room_id]
+        is_redacted = event.internal_metadata.is_redacted()
 
         if relation_type is not None:
             where_clause.append("relation_type = ?")
@@ -133,10 +206,6 @@ class RelationsWorkerStore(SQLBaseStore):
         if event_type is not None:
             where_clause.append("type = ?")
             where_args.append(event_type)
-
-        if aggregation_key:
-            where_clause.append("aggregation_key = ?")
-            where_args.append(aggregation_key)
 
         pagination_clause = generate_pagination_where_clause(
             direction=direction,
@@ -157,7 +226,7 @@ class RelationsWorkerStore(SQLBaseStore):
             order = "ASC"
 
         sql = """
-            SELECT event_id, topological_ordering, stream_ordering
+            SELECT event_id, relation_type, sender, topological_ordering, stream_ordering
             FROM event_relations
             INNER JOIN events USING (event_id)
             WHERE %s
@@ -171,23 +240,47 @@ class RelationsWorkerStore(SQLBaseStore):
 
         def _get_recent_references_for_event_txn(
             txn: LoggingTransaction,
-        ) -> PaginationChunk:
+        ) -> Tuple[List[_RelatedEvent], Optional[StreamToken]]:
             txn.execute(sql, where_args + [limit + 1])
 
-            last_topo_id = None
-            last_stream_id = None
             events = []
-            for row in txn:
-                events.append({"event_id": row[0]})
-                last_topo_id = row[1]
-                last_stream_id = row[2]
+            topo_orderings: List[int] = []
+            stream_orderings: List[int] = []
+            for event_id, relation_type, sender, topo_ordering, stream_ordering in cast(
+                List[Tuple[str, str, str, int, int]], txn
+            ):
+                # Do not include edits for redacted events as they leak event
+                # content.
+                if not is_redacted or relation_type != RelationTypes.REPLACE:
+                    events.append(_RelatedEvent(event_id, sender))
+                    topo_orderings.append(topo_ordering)
+                    stream_orderings.append(stream_ordering)
 
-            # If there are more events, generate the next pagination key.
+            # If there are more events, generate the next pagination key from the
+            # last event returned.
             next_token = None
-            if len(events) > limit and last_topo_id and last_stream_id:
-                next_key = RoomStreamToken(last_topo_id, last_stream_id)
+            if len(events) > limit:
+                # Instead of using the last row (which tells us there is more
+                # data), use the last row to be returned.
+                events = events[:limit]
+                topo_orderings = topo_orderings[:limit]
+                stream_orderings = stream_orderings[:limit]
+
+                topo = topo_orderings[-1]
+                token = stream_orderings[-1]
+                if direction == "b":
+                    # Tokens are positions between events.
+                    # This token points *after* the last event in the chunk.
+                    # We need it to point to the event before it in the chunk
+                    # when we are going backwards so we subtract one from the
+                    # stream part.
+                    token -= 1
+                next_key = RoomStreamToken(topo, token)
+
                 if from_token:
-                    next_token = from_token.copy_and_replace("room_key", next_key)
+                    next_token = from_token.copy_and_replace(
+                        StreamKeyType.ROOM, next_key
+                    )
                 else:
                     next_token = StreamToken(
                         room_key=next_key,
@@ -201,12 +294,46 @@ class RelationsWorkerStore(SQLBaseStore):
                         groups_key=0,
                     )
 
-            return PaginationChunk(
-                chunk=list(events[:limit]), next_batch=next_token, prev_batch=from_token
-            )
+            return events[:limit], next_token
 
         return await self.db_pool.runInteraction(
             "get_recent_references_for_event", _get_recent_references_for_event_txn
+        )
+
+    async def get_all_relations_for_event_with_types(
+        self,
+        event_id: str,
+        relation_types: List[str],
+    ) -> List[str]:
+        """Get the event IDs of all events that have a relation to the given event with
+        one of the given relation types.
+
+        Args:
+            event_id: The event for which to look for related events.
+            relation_types: The types of relations to look for.
+
+        Returns:
+            A list of the IDs of the events that relate to the given event with one of
+            the given relation types.
+        """
+
+        def get_all_relation_ids_for_event_with_types_txn(
+            txn: LoggingTransaction,
+        ) -> List[str]:
+            rows = self.db_pool.simple_select_many_txn(
+                txn=txn,
+                table="event_relations",
+                column="relation_type",
+                iterable=relation_types,
+                keyvalues={"relates_to_id": event_id},
+                retcols=["event_id"],
+            )
+
+            return [row["event_id"] for row in rows]
+
+        return await self.db_pool.runInteraction(
+            desc="get_all_relation_ids_for_event_with_types",
+            func=get_all_relation_ids_for_event_with_types_txn,
         )
 
     async def event_includes_relation(self, event_id: str) -> bool:
@@ -272,102 +399,193 @@ class RelationsWorkerStore(SQLBaseStore):
         )
         return result is not None
 
-    @cached(tree=True)
-    async def get_aggregation_groups_for_event(
-        self,
-        event_id: str,
-        room_id: str,
-        event_type: Optional[str] = None,
-        limit: int = 5,
-        direction: str = "b",
-        from_token: Optional[AggregationPaginationToken] = None,
-        to_token: Optional[AggregationPaginationToken] = None,
-    ) -> PaginationChunk:
-        """Get a list of annotations on the event, grouped by event type and
+    @cached()
+    async def get_aggregation_groups_for_event(self, event_id: str) -> List[JsonDict]:
+        raise NotImplementedError()
+
+    @cachedList(
+        cached_method_name="get_aggregation_groups_for_event", list_name="event_ids"
+    )
+    async def get_aggregation_groups_for_events(
+        self, event_ids: Collection[str]
+    ) -> Mapping[str, Optional[List[JsonDict]]]:
+        """Get a list of annotations on the given events, grouped by event type and
         aggregation key, sorted by count.
 
         This is used e.g. to get the what and how many reactions have happend
         on an event.
 
         Args:
-            event_id: Fetch events that relate to this event ID.
-            room_id: The room the event belongs to.
-            event_type: Only fetch events with this event type, if given.
-            limit: Only fetch the `limit` groups.
-            direction: Whether to fetch the highest count first (`"b"`) or
-                the lowest count first (`"f"`).
-            from_token: Fetch rows from the given token, or from the start if None.
-            to_token: Fetch rows up to the given token, or up to the end if None.
+            event_ids: Fetch events that relate to these event IDs.
 
         Returns:
-            List of groups of annotations that match. Each row is a dict with
-            `type`, `key` and `count` fields.
+            A map of event IDs to a list of groups of annotations that match.
+            Each entry is a dict with `type`, `key` and `count` fields.
+        """
+        # The number of entries to return per event ID.
+        limit = 5
+
+        clause, args = make_in_list_sql_clause(
+            self.database_engine, "relates_to_id", event_ids
+        )
+        args.append(RelationTypes.ANNOTATION)
+
+        sql = f"""
+            SELECT
+                relates_to_id,
+                annotation.type,
+                aggregation_key,
+                COUNT(DISTINCT annotation.sender)
+            FROM events AS annotation
+            INNER JOIN event_relations USING (event_id)
+            INNER JOIN events AS parent ON
+                parent.event_id = relates_to_id
+                AND parent.room_id = annotation.room_id
+            WHERE
+                {clause}
+                AND relation_type = ?
+            GROUP BY relates_to_id, annotation.type, aggregation_key
+            ORDER BY relates_to_id, COUNT(*) DESC
         """
 
-        where_clause = ["relates_to_id = ?", "room_id = ?", "relation_type = ?"]
-        where_args: List[Union[str, int]] = [
-            event_id,
-            room_id,
-            RelationTypes.ANNOTATION,
-        ]
-
-        if event_type:
-            where_clause.append("type = ?")
-            where_args.append(event_type)
-
-        having_clause = generate_pagination_where_clause(
-            direction=direction,
-            column_names=("COUNT(*)", "MAX(stream_ordering)"),
-            from_token=attr.astuple(from_token) if from_token else None,  # type: ignore[arg-type]
-            to_token=attr.astuple(to_token) if to_token else None,  # type: ignore[arg-type]
-            engine=self.database_engine,
-        )
-
-        if direction == "b":
-            order = "DESC"
-        else:
-            order = "ASC"
-
-        if having_clause:
-            having_clause = "HAVING " + having_clause
-        else:
-            having_clause = ""
-
-        sql = """
-            SELECT type, aggregation_key, COUNT(DISTINCT sender), MAX(stream_ordering)
-            FROM event_relations
-            INNER JOIN events USING (event_id)
-            WHERE {where_clause}
-            GROUP BY relation_type, type, aggregation_key
-            {having_clause}
-            ORDER BY COUNT(*) {order}, MAX(stream_ordering) {order}
-            LIMIT ?
-        """.format(
-            where_clause=" AND ".join(where_clause),
-            order=order,
-            having_clause=having_clause,
-        )
-
-        def _get_aggregation_groups_for_event_txn(
+        def _get_aggregation_groups_for_events_txn(
             txn: LoggingTransaction,
-        ) -> PaginationChunk:
-            txn.execute(sql, where_args + [limit + 1])
+        ) -> Mapping[str, List[JsonDict]]:
+            txn.execute(sql, args)
 
-            next_batch = None
-            events = []
-            for row in txn:
-                events.append({"type": row[0], "key": row[1], "count": row[2]})
-                next_batch = AggregationPaginationToken(row[2], row[3])
+            result: Dict[str, List[JsonDict]] = {}
+            for event_id, type, key, count in cast(
+                List[Tuple[str, str, str, int]], txn
+            ):
+                event_results = result.setdefault(event_id, [])
 
-            if len(events) <= limit:
-                next_batch = None
+                # Limit the number of results per event ID.
+                if len(event_results) == limit:
+                    continue
 
-            return PaginationChunk(
-                chunk=list(events[:limit]), next_batch=next_batch, prev_batch=from_token
-            )
+                event_results.append({"type": type, "key": key, "count": count})
+
+            return result
 
         return await self.db_pool.runInteraction(
-            "get_aggregation_groups_for_event", _get_aggregation_groups_for_event_txn
+            "get_aggregation_groups_for_events", _get_aggregation_groups_for_events_txn
+        )
+
+    async def get_aggregation_groups_for_users(
+        self, event_ids: Collection[str], users: FrozenSet[str]
+    ) -> Dict[str, Dict[Tuple[str, str], int]]:
+        """Fetch the partial aggregations for an event for specific users.
+
+        This is used, in conjunction with get_aggregation_groups_for_event, to
+        remove information from the results for ignored users.
+
+        Args:
+            event_ids: Fetch events that relate to these event IDs.
+            users: The users to fetch information for.
+
+        Returns:
+            A map of event ID to a map of (event type, aggregation key) to a
+            count of users.
+        """
+
+        if not users:
+            return {}
+
+        events_sql, args = make_in_list_sql_clause(
+            self.database_engine, "relates_to_id", event_ids
+        )
+
+        users_sql, users_args = make_in_list_sql_clause(
+            self.database_engine, "annotation.sender", users
+        )
+        args.extend(users_args)
+        args.append(RelationTypes.ANNOTATION)
+
+        sql = f"""
+            SELECT
+                relates_to_id,
+                annotation.type,
+                aggregation_key,
+                COUNT(DISTINCT annotation.sender)
+            FROM events AS annotation
+            INNER JOIN event_relations USING (event_id)
+            INNER JOIN events AS parent ON
+                parent.event_id = relates_to_id
+                AND parent.room_id = annotation.room_id
+            WHERE {events_sql} AND {users_sql} AND relation_type = ?
+            GROUP BY relates_to_id, annotation.type, aggregation_key
+            ORDER BY relates_to_id, COUNT(*) DESC
+        """
+
+        def _get_aggregation_groups_for_users_txn(
+            txn: LoggingTransaction,
+        ) -> Dict[str, Dict[Tuple[str, str], int]]:
+            txn.execute(sql, args)
+
+            result: Dict[str, Dict[Tuple[str, str], int]] = {}
+            for event_id, type, key, count in cast(
+                List[Tuple[str, str, str, int]], txn
+            ):
+                result.setdefault(event_id, {})[(type, key)] = count
+
+            return result
+
+        return await self.db_pool.runInteraction(
+            "get_aggregation_groups_for_users", _get_aggregation_groups_for_users_txn
+        )
+
+    @cached()
+    async def get_references_for_event(self, event_id: str) -> List[JsonDict]:
+        raise NotImplementedError()
+
+    @cachedList(cached_method_name="get_references_for_event", list_name="event_ids")
+    async def get_references_for_events(
+        self, event_ids: Collection[str]
+    ) -> Mapping[str, Optional[List[_RelatedEvent]]]:
+        """Get a list of references to the given events.
+
+        Args:
+            event_ids: Fetch events that relate to these event IDs.
+
+        Returns:
+            A map of event IDs to a list of related event IDs (and their senders).
+        """
+
+        clause, args = make_in_list_sql_clause(
+            self.database_engine, "relates_to_id", event_ids
+        )
+        args.append(RelationTypes.REFERENCE)
+
+        sql = f"""
+            SELECT relates_to_id, ref.event_id, ref.sender
+            FROM events AS ref
+            INNER JOIN event_relations USING (event_id)
+            INNER JOIN events AS parent ON
+                parent.event_id = relates_to_id
+                AND parent.room_id = ref.room_id
+            WHERE
+                {clause}
+                AND relation_type = ?
+            ORDER BY ref.topological_ordering, ref.stream_ordering
+        """
+
+        def _get_references_for_events_txn(
+            txn: LoggingTransaction,
+        ) -> Mapping[str, List[_RelatedEvent]]:
+            txn.execute(sql, args)
+
+            result: Dict[str, List[_RelatedEvent]] = {}
+            for relates_to_id, event_id, sender in cast(
+                List[Tuple[str, str, str]], txn
+            ):
+                result.setdefault(relates_to_id, []).append(
+                    _RelatedEvent(event_id, sender)
+                )
+
+            return result
+
+        return await self.db_pool.runInteraction(
+            "_get_references_for_events_txn", _get_references_for_events_txn
         )
 
     @cached()
@@ -375,7 +593,7 @@ class RelationsWorkerStore(SQLBaseStore):
         raise NotImplementedError()
 
     @cachedList(cached_method_name="get_applicable_edit", list_name="event_ids")
-    async def _get_applicable_edits(
+    async def get_applicable_edits(
         self, event_ids: Collection[str]
     ) -> Dict[str, Optional[EventBase]]:
         """Get the most recent edit (if any) that has happened for the given
@@ -464,10 +682,10 @@ class RelationsWorkerStore(SQLBaseStore):
         raise NotImplementedError()
 
     @cachedList(cached_method_name="get_thread_summary", list_name="event_ids")
-    async def _get_thread_summaries(
+    async def get_thread_summaries(
         self, event_ids: Collection[str]
-    ) -> Dict[str, Optional[Tuple[int, EventBase, Optional[EventBase]]]]:
-        """Get the number of threaded replies, the latest reply (if any), and the latest edit for that reply for the given event.
+    ) -> Dict[str, Optional[Tuple[int, EventBase]]]:
+        """Get the number of threaded replies and the latest reply (if any) for the given events.
 
         Args:
             event_ids: Summarize the thread related to this event ID.
@@ -479,7 +697,6 @@ class RelationsWorkerStore(SQLBaseStore):
             Each summary is a tuple of:
                 The number of events in the thread.
                 The most recent event in the thread.
-                The most recent edit to the most recent event in the thread, if applicable.
         """
 
         def _get_thread_summaries_txn(
@@ -565,9 +782,6 @@ class RelationsWorkerStore(SQLBaseStore):
 
         latest_events = await self.get_events(latest_event_ids.values())  # type: ignore[attr-defined]
 
-        # Check to see if any of those events are edited.
-        latest_edits = await self._get_applicable_edits(latest_event_ids.values())
-
         # Map to the event IDs to the thread summary.
         #
         # There might not be a summary due to there not being a thread or
@@ -578,18 +792,71 @@ class RelationsWorkerStore(SQLBaseStore):
 
             summary = None
             if latest_event:
-                latest_edit = latest_edits.get(latest_event_id)
-                summary = (counts[parent_event_id], latest_event, latest_edit)
+                summary = (counts[parent_event_id], latest_event)
             summaries[parent_event_id] = summary
 
         return summaries
+
+    async def get_threaded_messages_per_user(
+        self,
+        event_ids: Collection[str],
+        users: FrozenSet[str] = frozenset(),
+    ) -> Dict[Tuple[str, str], int]:
+        """Get the number of threaded replies for a set of users.
+
+        This is used, in conjunction with get_thread_summaries, to calculate an
+        accurate count of the replies to a thread by subtracting ignored users.
+
+        Args:
+            event_ids: The events to check for threaded replies.
+            users: The user to calculate the count of their replies.
+
+        Returns:
+            A map of the (event_id, sender) to the count of their replies.
+        """
+        if not users:
+            return {}
+
+        # Fetch the number of threaded replies.
+        sql = """
+            SELECT parent.event_id, child.sender, COUNT(child.event_id) FROM events AS child
+            INNER JOIN event_relations USING (event_id)
+            INNER JOIN events AS parent ON
+                parent.event_id = relates_to_id
+                AND parent.room_id = child.room_id
+            WHERE
+                relation_type = ?
+                AND %s
+                AND %s
+            GROUP BY parent.event_id, child.sender
+        """
+
+        def _get_threaded_messages_per_user_txn(
+            txn: LoggingTransaction,
+        ) -> Dict[Tuple[str, str], int]:
+            users_sql, users_args = make_in_list_sql_clause(
+                self.database_engine, "child.sender", users
+            )
+            events_clause, events_args = make_in_list_sql_clause(
+                txn.database_engine, "relates_to_id", event_ids
+            )
+
+            txn.execute(
+                sql % (users_sql, events_clause),
+                [RelationTypes.THREAD] + users_args + events_args,
+            )
+            return {(row[0], row[1]): row[2] for row in txn}
+
+        return await self.db_pool.runInteraction(
+            "get_threaded_messages_per_user", _get_threaded_messages_per_user_txn
+        )
 
     @cached()
     def get_thread_participated(self, event_id: str, user_id: str) -> bool:
         raise NotImplementedError()
 
     @cachedList(cached_method_name="get_thread_participated", list_name="event_ids")
-    async def _get_threads_participated(
+    async def get_threads_participated(
         self, event_ids: Collection[str], user_id: str
     ) -> Dict[str, bool]:
         """Get whether the requesting user participated in the given threads.
@@ -606,7 +873,7 @@ class RelationsWorkerStore(SQLBaseStore):
             user participated in that event's thread, otherwise false.
         """
 
-        def _get_thread_summary_txn(txn: LoggingTransaction) -> Set[str]:
+        def _get_threads_participated_txn(txn: LoggingTransaction) -> Set[str]:
             # Fetch whether the requester has participated or not.
             sql = """
                 SELECT DISTINCT relates_to_id
@@ -624,13 +891,13 @@ class RelationsWorkerStore(SQLBaseStore):
             clause, args = make_in_list_sql_clause(
                 txn.database_engine, "relates_to_id", event_ids
             )
-            args.extend((RelationTypes.THREAD, user_id))
+            args.extend([RelationTypes.THREAD, user_id])
 
             txn.execute(sql % (clause,), args)
             return {row[0] for row in txn.fetchall()}
 
         participated_threads = await self.db_pool.runInteraction(
-            "get_thread_summary", _get_thread_summary_txn
+            "get_threads_participated", _get_threads_participated_txn
         )
 
         return {event_id: event_id in participated_threads for event_id in event_ids}
@@ -663,7 +930,7 @@ class RelationsWorkerStore(SQLBaseStore):
                 %s;
         """
 
-        def _get_if_events_have_relations(txn) -> List[str]:
+        def _get_if_events_have_relations(txn: LoggingTransaction) -> List[str]:
             clauses: List[str] = []
             clause, args = make_in_list_sql_clause(
                 txn.database_engine, "relates_to_id", parent_ids
@@ -737,121 +1004,193 @@ class RelationsWorkerStore(SQLBaseStore):
             "get_if_user_has_annotated_event", _get_if_user_has_annotated_event
         )
 
-    async def _get_bundled_aggregation_for_event(
-        self, event: EventBase, user_id: str
-    ) -> Optional[BundledAggregations]:
-        """Generate bundled aggregations for an event.
-
-        Note that this does not use a cache, but depends on cached methods.
+    @cached(tree=True)
+    async def get_threads(
+        self,
+        room_id: str,
+        limit: int = 5,
+        from_token: Optional[ThreadsNextBatch] = None,
+    ) -> Tuple[List[str], Optional[ThreadsNextBatch]]:
+        """Get a list of thread IDs, ordered by topological ordering of their
+        latest reply.
 
         Args:
-            event: The event to calculate bundled aggregations for.
-            user_id: The user requesting the bundled aggregations.
+            room_id: The room the event belongs to.
+            limit: Only fetch the most recent `limit` threads.
+            from_token: Fetch rows from a previous next_batch, or from the start if None.
 
         Returns:
-            The bundled aggregations for an event, if bundled aggregations are
-            enabled and the event can have bundled aggregations.
+            A tuple of:
+                A list of thread root event IDs.
+
+                The next_batch, if one exists.
         """
-
-        # Do not bundle aggregations for an event which represents an edit or an
-        # annotation. It does not make sense for them to have related events.
-        relates_to = event.content.get("m.relates_to")
-        if isinstance(relates_to, (dict, frozendict)):
-            relation_type = relates_to.get("rel_type")
-            if relation_type in (RelationTypes.ANNOTATION, RelationTypes.REPLACE):
-                return None
-
-        event_id = event.event_id
-        room_id = event.room_id
-
-        # The bundled aggregations to include, a mapping of relation type to a
-        # type-specific value. Some types include the direct return type here
-        # while others need more processing during serialization.
-        aggregations = BundledAggregations()
-
-        annotations = await self.get_aggregation_groups_for_event(event_id, room_id)
-        if annotations.chunk:
-            aggregations.annotations = await annotations.to_dict(
-                cast("DataStore", self)
+        # Generate the pagination clause, if necessary.
+        #
+        # Find any threads where the latest reply is equal / before the last
+        # thread's topo ordering and earlier in stream ordering.
+        pagination_clause = ""
+        pagination_args: tuple = ()
+        if from_token:
+            pagination_clause = "AND topological_ordering <= ? AND stream_ordering < ?"
+            pagination_args = (
+                from_token.topological_ordering,
+                from_token.stream_ordering,
             )
 
-        references = await self.get_relations_for_event(
-            event_id, room_id, RelationTypes.REFERENCE, direction="f"
+        sql = f"""
+            SELECT thread_id, topological_ordering, stream_ordering
+            FROM threads
+            WHERE
+                room_id = ?
+                {pagination_clause}
+            ORDER BY topological_ordering DESC, stream_ordering DESC
+            LIMIT ?
+        """
+
+        def _get_threads_txn(
+            txn: LoggingTransaction,
+        ) -> Tuple[List[str], Optional[ThreadsNextBatch]]:
+            txn.execute(sql, (room_id, *pagination_args, limit + 1))
+
+            rows = cast(List[Tuple[str, int, int]], txn.fetchall())
+            thread_ids = [r[0] for r in rows]
+
+            # If there are more events, generate the next pagination key from the
+            # last thread which will be returned.
+            next_token = None
+            if len(thread_ids) > limit:
+                last_topo_id = rows[-2][1]
+                last_stream_id = rows[-2][2]
+                next_token = ThreadsNextBatch(last_topo_id, last_stream_id)
+
+            return thread_ids[:limit], next_token
+
+        return await self.db_pool.runInteraction("get_threads", _get_threads_txn)
+
+    @cached()
+    async def get_thread_id(self, event_id: str) -> str:
+        """
+        Get the thread ID for an event. This considers multi-level relations,
+        e.g. an annotation to an event which is part of a thread.
+
+        It only searches up the relations tree, i.e. it only searches for events
+        which the given event is related to (and which those events are related
+        to, etc.)
+
+        Given the following DAG:
+
+            A <---[m.thread]-- B <--[m.annotation]-- C
+            ^
+            |--[m.reference]-- D <--[m.annotation]-- E
+
+        get_thread_id(X) considers events B and C as part of thread A.
+
+        See also get_thread_id_for_receipts.
+
+        Args:
+            event_id: The event ID to fetch the thread ID for.
+
+        Returns:
+            The event ID of the root event in the thread, if this event is part
+            of a thread. "main", otherwise.
+        """
+
+        # Recurse event relations up to the *root* event, then search that chain
+        # of relations for a thread relation. If one is found, the root event is
+        # returned.
+        #
+        # Note that this should only ever find 0 or 1 entries since it is invalid
+        # for an event to have a thread relation to an event which also has a
+        # relation.
+        sql = """
+            WITH RECURSIVE related_events AS (
+                SELECT event_id, relates_to_id, relation_type, 0 depth
+                FROM event_relations
+                WHERE event_id = ?
+                UNION SELECT e.event_id, e.relates_to_id, e.relation_type, depth + 1
+                FROM event_relations e
+                INNER JOIN related_events r ON r.relates_to_id = e.event_id
+                WHERE depth <= 3
+            )
+            SELECT relates_to_id FROM related_events
+            WHERE relation_type = 'm.thread'
+            ORDER BY depth DESC
+            LIMIT 1;
+        """
+
+        def _get_thread_id(txn: LoggingTransaction) -> str:
+            txn.execute(sql, (event_id,))
+            row = txn.fetchone()
+            if row:
+                return row[0]
+
+            # If no thread was found, it is part of the main timeline.
+            return MAIN_TIMELINE
+
+        return await self.db_pool.runInteraction("get_thread_id", _get_thread_id)
+
+    @cached()
+    async def get_thread_id_for_receipts(self, event_id: str) -> str:
+        """
+        Get the thread ID for an event by traversing to the top-most related event
+        and confirming any children events form a thread.
+
+        Given the following DAG:
+
+            A <---[m.thread]-- B <--[m.annotation]-- C
+            ^
+            |--[m.reference]-- D <--[m.annotation]-- E
+
+        get_thread_id_for_receipts(X) considers events A, B, C, D, and E as part
+        of thread A.
+
+        See also get_thread_id.
+
+        Args:
+            event_id: The event ID to fetch the thread ID for.
+
+        Returns:
+            The event ID of the root event in the thread, if this event is part
+            of a thread. "main", otherwise.
+        """
+
+        # Recurse event relations up to the *root* event, then search for any events
+        # related to that root node for a thread relation. If one is found, the
+        # root event is returned.
+        #
+        # Note that there cannot be thread relations in the middle of the chain since
+        # it is invalid for an event to have a thread relation to an event which also
+        # has a relation.
+        sql = """
+        SELECT relates_to_id FROM event_relations WHERE relates_to_id = COALESCE((
+            WITH RECURSIVE related_events AS (
+                SELECT event_id, relates_to_id, relation_type, 0 depth
+                FROM event_relations
+                WHERE event_id = ?
+                UNION SELECT e.event_id, e.relates_to_id, e.relation_type, depth + 1
+                FROM event_relations e
+                INNER JOIN related_events r ON r.relates_to_id = e.event_id
+                WHERE depth <= 3
+            )
+            SELECT relates_to_id FROM related_events
+            ORDER BY depth DESC
+            LIMIT 1
+        ), ?) AND relation_type = 'm.thread' LIMIT 1;
+        """
+
+        def _get_related_thread_id(txn: LoggingTransaction) -> str:
+            txn.execute(sql, (event_id, event_id))
+            row = txn.fetchone()
+            if row:
+                return row[0]
+
+            # If no thread was found, it is part of the main timeline.
+            return MAIN_TIMELINE
+
+        return await self.db_pool.runInteraction(
+            "get_related_thread_id", _get_related_thread_id
         )
-        if references.chunk:
-            aggregations.references = await references.to_dict(cast("DataStore", self))
-
-        # Store the bundled aggregations in the event metadata for later use.
-        return aggregations
-
-    async def get_bundled_aggregations(
-        self, events: Iterable[EventBase], user_id: str
-    ) -> Dict[str, BundledAggregations]:
-        """Generate bundled aggregations for events.
-
-        Args:
-            events: The iterable of events to calculate bundled aggregations for.
-            user_id: The user requesting the bundled aggregations.
-
-        Returns:
-            A map of event ID to the bundled aggregation for the event. Not all
-            events may have bundled aggregations in the results.
-        """
-        # The already processed event IDs. Tracked separately from the result
-        # since the result omits events which do not have bundled aggregations.
-        seen_event_ids = set()
-
-        # State events and redacted events do not get bundled aggregations.
-        events = [
-            event
-            for event in events
-            if not event.is_state() and not event.internal_metadata.is_redacted()
-        ]
-
-        # event ID -> bundled aggregation in non-serialized form.
-        results: Dict[str, BundledAggregations] = {}
-
-        # Fetch other relations per event.
-        for event in events:
-            # De-duplicate events by ID to handle the same event requested multiple
-            # times. The caches that _get_bundled_aggregation_for_event use should
-            # capture this, but best to reduce work.
-            if event.event_id in seen_event_ids:
-                continue
-            seen_event_ids.add(event.event_id)
-
-            event_result = await self._get_bundled_aggregation_for_event(event, user_id)
-            if event_result:
-                results[event.event_id] = event_result
-
-        # Fetch any edits.
-        edits = await self._get_applicable_edits(seen_event_ids)
-        for event_id, edit in edits.items():
-            results.setdefault(event_id, BundledAggregations()).replace = edit
-
-        # Fetch thread summaries.
-        if self._msc3440_enabled:
-            summaries = await self._get_thread_summaries(seen_event_ids)
-            # Only fetch participated for a limited selection based on what had
-            # summaries.
-            participated = await self._get_threads_participated(
-                summaries.keys(), user_id
-            )
-            for event_id, summary in summaries.items():
-                if summary:
-                    thread_count, latest_thread_event, edit = summary
-                    results.setdefault(
-                        event_id, BundledAggregations()
-                    ).thread = _ThreadAggregation(
-                        latest_event=latest_thread_event,
-                        latest_edit=edit,
-                        count=thread_count,
-                        # If there's a thread summary it must also exist in the
-                        # participated dictionary.
-                        current_user_participated=participated[event_id],
-                    )
-
-        return results
 
 
 class RelationsStore(RelationsWorkerStore):

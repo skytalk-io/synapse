@@ -16,9 +16,7 @@
 import logging
 import os
 import sys
-from typing import Dict, Iterable, Iterator, List
-
-from matrix_common.versionstring import get_distribution_version_string
+from typing import Dict, Iterable, List
 
 from twisted.internet.tcp import Port
 from twisted.web.resource import EncodingResourceWrapper, Resource
@@ -33,20 +31,18 @@ from synapse.api.urls import (
     LEGACY_MEDIA_PREFIX,
     MEDIA_R0_PREFIX,
     MEDIA_V3_PREFIX,
-    SERVER_KEY_V2_PREFIX,
+    SERVER_KEY_PREFIX,
     STATIC_PREFIX,
 )
 from synapse.app import _base
 from synapse.app._base import (
     handle_startup_exception,
-    listen_ssl,
-    listen_tcp,
+    listen_http,
     max_request_body_size,
     redirect_stdio_to_logs,
     register_start,
 )
-from synapse.config._base import ConfigError
-from synapse.config.emailconfig import ThreepidBehaviour
+from synapse.config._base import ConfigError, format_config_error
 from synapse.config.homeserver import HomeServerConfig
 from synapse.config.server import ListenerConfig
 from synapse.federation.transport.server import TransportLayerServer
@@ -56,20 +52,18 @@ from synapse.http.server import (
     RootOptionsRedirectResource,
     StaticResource,
 )
-from synapse.http.site import SynapseSite
 from synapse.logging.context import LoggingContext
 from synapse.metrics import METRICS_PREFIX, MetricsResource, RegistryProxy
 from synapse.replication.http import REPLICATION_PREFIX, ReplicationRestResource
-from synapse.replication.tcp.resource import ReplicationStreamProtocolFactory
 from synapse.rest import ClientRestResource
 from synapse.rest.admin import AdminRestResource
 from synapse.rest.health import HealthResource
-from synapse.rest.key.v2 import KeyApiV2Resource
+from synapse.rest.key.v2 import KeyResource
 from synapse.rest.synapse.client import build_synapse_client_resource_tree
 from synapse.rest.well_known import well_known_resource
 from synapse.server import HomeServer
 from synapse.storage import DataStore
-from synapse.util.check_dependencies import check_requirements
+from synapse.util.check_dependencies import VERSION, check_requirements
 from synapse.util.httpresourcetree import create_resource_tree
 from synapse.util.module_loader import load_module
 
@@ -87,8 +81,6 @@ class SynapseHomeServer(HomeServer):
         self, config: HomeServerConfig, listener_config: ListenerConfig
     ) -> Iterable[Port]:
         port = listener_config.port
-        bind_addresses = listener_config.bind_addresses
-        tls = listener_config.tls
         # Must exist since this is an HTTP listener.
         assert listener_config.http_options is not None
         site_tag = listener_config.http_options.tag
@@ -144,36 +136,14 @@ class SynapseHomeServer(HomeServer):
         else:
             root_resource = OptionsResource()
 
-        site = SynapseSite(
-            "synapse.access.%s.%s" % ("https" if tls else "http", site_tag),
-            site_tag,
+        ports = listen_http(
             listener_config,
             create_resource_tree(resources, root_resource),
             self.version_string,
-            max_request_body_size=max_request_body_size(self.config),
+            max_request_body_size(self.config),
+            self.tls_server_context_factory,
             reactor=self.get_reactor(),
         )
-
-        if tls:
-            # refresh_certificate should have been called before this.
-            assert self.tls_server_context_factory is not None
-            ports = listen_ssl(
-                bind_addresses,
-                port,
-                site,
-                self.tls_server_context_factory,
-                reactor=self.get_reactor(),
-            )
-            logger.info("Synapse now listening on TCP port %d (TLS)", port)
-
-        else:
-            ports = listen_tcp(
-                bind_addresses,
-                port,
-                site,
-                reactor=self.get_reactor(),
-            )
-            logger.info("Synapse now listening on TCP port %d", port)
 
         return ports
 
@@ -204,7 +174,7 @@ class SynapseHomeServer(HomeServer):
                 }
             )
 
-            if self.config.email.threepid_behaviour_email == ThreepidBehaviour.LOCAL:
+            if self.config.email.can_verify_email:
                 from synapse.rest.synapse.client.password_reset import (
                     PasswordResetSubmitTokenResource,
                 )
@@ -219,27 +189,22 @@ class SynapseHomeServer(HomeServer):
             consent_resource: Resource = ConsentResource(self)
             if compress:
                 consent_resource = gz_wrap(consent_resource)
-            resources.update({"/_matrix/consent": consent_resource})
+            resources["/_matrix/consent"] = consent_resource
 
         if name == "federation":
-            resources.update({FEDERATION_PREFIX: TransportLayerServer(self)})
+            federation_resource: Resource = TransportLayerServer(self)
+            if compress:
+                federation_resource = gz_wrap(federation_resource)
+            resources[FEDERATION_PREFIX] = federation_resource
 
         if name == "openid":
-            resources.update(
-                {
-                    FEDERATION_PREFIX: TransportLayerServer(
-                        self, servlet_groups=["openid"]
-                    )
-                }
+            resources[FEDERATION_PREFIX] = TransportLayerServer(
+                self, servlet_groups=["openid"]
             )
 
         if name in ["static", "client"]:
-            resources.update(
-                {
-                    STATIC_PREFIX: StaticResource(
-                        os.path.join(os.path.dirname(synapse.__file__), "static")
-                    )
-                }
+            resources[STATIC_PREFIX] = StaticResource(
+                os.path.join(os.path.dirname(synapse.__file__), "static")
             )
 
         if name in ["media", "federation", "client"]:
@@ -258,10 +223,13 @@ class SynapseHomeServer(HomeServer):
                 )
 
         if name in ["keys", "federation"]:
-            resources[SERVER_KEY_V2_PREFIX] = KeyApiV2Resource(self)
+            resources[SERVER_KEY_PREFIX] = KeyResource(self)
 
         if name == "metrics" and self.config.metrics.enable_metrics:
-            resources[METRICS_PREFIX] = MetricsResource(RegistryProxy)
+            metrics_resource: Resource = MetricsResource(RegistryProxy)
+            if compress:
+                metrics_resource = gz_wrap(metrics_resource)
+            resources[METRICS_PREFIX] = metrics_resource
 
         if name == "replication":
             resources[REPLICATION_PREFIX] = ReplicationRestResource(self)
@@ -273,7 +241,7 @@ class SynapseHomeServer(HomeServer):
             # If redis is enabled we connect via the replication command handler
             # in the same way as the workers (since we're effectively a client
             # rather than a server).
-            self.get_tcp_replication().start_replication(self)
+            self.get_replication_command_handler().start_replication(self)
 
         for listener in self.config.server.listeners:
             if listener.type == "http":
@@ -287,16 +255,6 @@ class SynapseHomeServer(HomeServer):
                     manhole_settings=self.config.server.manhole_settings,
                     manhole_globals={"hs": self},
                 )
-            elif listener.type == "replication":
-                services = listen_tcp(
-                    listener.bind_addresses,
-                    listener.port,
-                    ReplicationStreamProtocolFactory(self),
-                )
-                for s in services:
-                    self.get_reactor().addSystemEventTrigger(
-                        "before", "shutdown", s.stopListening
-                    )
             elif listener.type == "metrics":
                 if not self.config.metrics.enable_metrics:
                     logger.warning(
@@ -304,7 +262,10 @@ class SynapseHomeServer(HomeServer):
                         "enable_metrics is not True!"
                     )
                 else:
-                    _base.listen_metrics(listener.bind_addresses, listener.port)
+                    _base.listen_metrics(
+                        listener.bind_addresses,
+                        listener.port,
+                    )
             else:
                 # this shouldn't happen, as the listener type should have been checked
                 # during parsing
@@ -348,10 +309,27 @@ def setup(config_options: List[str]) -> SynapseHomeServer:
     if config.server.gc_seconds:
         synapse.metrics.MIN_TIME_BETWEEN_GCS = config.server.gc_seconds
 
+    if (
+        config.registration.enable_registration
+        and not config.registration.enable_registration_without_verification
+    ):
+        if (
+            not config.captcha.enable_registration_captcha
+            and not config.registration.registrations_require_3pid
+            and not config.registration.registration_requires_token
+        ):
+
+            raise ConfigError(
+                "You have enabled open registration without any verification. This is a known vector for "
+                "spam and abuse. If you would like to allow public registration, please consider adding email, "
+                "captcha, or token-based verification. Otherwise this check can be removed by setting the "
+                "`enable_registration_without_verification` config option to `true`."
+            )
+
     hs = SynapseHomeServer(
         config.server.server_name,
         config=config,
-        version_string="Synapse/" + get_distribution_version_string("matrix-synapse"),
+        version_string=f"Synapse/{VERSION}",
     )
 
     synapse.config.logger.setup_logging(hs, config, use_worker_options=False)
@@ -377,38 +355,6 @@ def setup(config_options: List[str]) -> SynapseHomeServer:
     register_start(start)
 
     return hs
-
-
-def format_config_error(e: ConfigError) -> Iterator[str]:
-    """
-    Formats a config error neatly
-
-    The idea is to format the immediate error, plus the "causes" of those errors,
-    hopefully in a way that makes sense to the user. For example:
-
-        Error in configuration at 'oidc_config.user_mapping_provider.config.display_name_template':
-          Failed to parse config for module 'JinjaOidcMappingProvider':
-            invalid jinja template:
-              unexpected end of template, expected 'end of print statement'.
-
-    Args:
-        e: the error to be formatted
-
-    Returns: An iterator which yields string fragments to be formatted
-    """
-    yield "Error in configuration"
-
-    if e.path:
-        yield " at '%s'" % (".".join(e.path),)
-
-    yield ":\n  %s" % (e.msg,)
-
-    parent_e = e.__cause__
-    indent = 1
-    while parent_e:
-        indent += 1
-        yield ":\n%s%s" % ("  " * indent, str(parent_e))
-        parent_e = parent_e.__cause__
 
 
 def run(hs: HomeServer) -> None:

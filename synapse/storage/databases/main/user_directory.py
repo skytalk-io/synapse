@@ -26,7 +26,18 @@ from typing import (
     cast,
 )
 
+try:
+    # Figure out if ICU support is available for searching users.
+    import icu
+
+    USE_ICU = True
+except ModuleNotFoundError:
+    USE_ICU = False
+
+from typing_extensions import TypedDict
+
 from synapse.api.errors import StoreError
+from synapse.util.stringutils import non_null_str_or_none
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -40,7 +51,12 @@ from synapse.storage.database import (
 from synapse.storage.databases.main.state import StateFilter
 from synapse.storage.databases.main.state_deltas import StateDeltasStore
 from synapse.storage.engines import PostgresEngine, Sqlite3Engine
-from synapse.types import JsonDict, get_domain_from_id, get_localpart_from_id
+from synapse.types import (
+    JsonDict,
+    UserProfile,
+    get_domain_from_id,
+    get_localpart_from_id,
+)
 from synapse.util.caches.descriptors import cached
 
 logger = logging.getLogger(__name__)
@@ -61,7 +77,7 @@ class UserDirectoryBackgroundUpdateStore(StateDeltasStore):
     ) -> None:
         super().__init__(database, db_conn, hs)
 
-        self.server_name = hs.hostname
+        self.server_name: str = hs.hostname
 
         self.db_pool.updates.register_background_update_handler(
             "populate_user_directory_createtables",
@@ -177,9 +193,8 @@ class UserDirectoryBackgroundUpdateStore(StateDeltasStore):
         - who should be in the user_directory.
 
         Args:
-            progress (dict)
-            batch_size (int): Maximum number of state events to process
-                per cycle.
+            progress
+            batch_size: Maximum number of state events to process per cycle.
 
         Returns:
             number of events processed.
@@ -433,7 +448,9 @@ class UserDirectoryBackgroundUpdateStore(StateDeltasStore):
             (EventTypes.RoomHistoryVisibility, ""),
         )
 
-        current_state_ids = await self.get_filtered_current_state_ids(  # type: ignore[attr-defined]
+        # Getting the partial state is fine, as we're not looking at membership
+        # events.
+        current_state_ids = await self.get_partial_filtered_current_state_ids(  # type: ignore[attr-defined]
             room_id, StateFilter.from_types(types_to_filter)
         )
 
@@ -462,11 +479,9 @@ class UserDirectoryBackgroundUpdateStore(StateDeltasStore):
         """
         Update or add a user's profile in the user directory.
         """
-        # If the display name or avatar URL are unexpected types, overwrite them.
-        if not isinstance(display_name, str):
-            display_name = None
-        if not isinstance(avatar_url, str):
-            avatar_url = None
+        # If the display name or avatar URL are unexpected types, replace with None.
+        display_name = non_null_str_or_none(display_name)
+        avatar_url = non_null_str_or_none(avatar_url)
 
         def _update_profile_in_user_dir_txn(txn: LoggingTransaction) -> None:
             self.db_pool.simple_upsert_txn(
@@ -474,7 +489,6 @@ class UserDirectoryBackgroundUpdateStore(StateDeltasStore):
                 table="user_directory",
                 keyvalues={"user_id": user_id},
                 values={"display_name": display_name, "avatar_url": avatar_url},
-                lock=False,  # We're only inserter
             )
 
             if isinstance(self.database_engine, PostgresEngine):
@@ -504,7 +518,6 @@ class UserDirectoryBackgroundUpdateStore(StateDeltasStore):
                     table="user_directory_search",
                     keyvalues={"user_id": user_id},
                     values={"value": value},
-                    lock=False,  # We're only inserter
                 )
             else:
                 # This should be unreachable.
@@ -589,6 +602,11 @@ class UserDirectoryBackgroundUpdateStore(StateDeltasStore):
             updatevalues={"stream_id": stream_id},
             desc="update_user_directory_stream_pos",
         )
+
+
+class SearchResult(TypedDict):
+    limited: bool
+    results: List[UserProfile]
 
 
 class UserDirectoryStore(UserDirectoryBackgroundUpdateStore):
@@ -695,10 +713,10 @@ class UserDirectoryStore(UserDirectoryBackgroundUpdateStore):
         Returns the rooms that a user is in.
 
         Args:
-            user_id(str): Must be a local user
+            user_id: Must be a local user
 
         Returns:
-            list: user_id
+            List of room IDs
         """
         rows = await self.db_pool.simple_select_onecol(
             table="users_who_share_private_rooms",
@@ -718,49 +736,6 @@ class UserDirectoryStore(UserDirectoryBackgroundUpdateStore):
         users.update(rows)
         return list(users)
 
-    async def get_shared_rooms_for_users(
-        self, user_id: str, other_user_id: str
-    ) -> Set[str]:
-        """
-        Returns the rooms that a local user shares with another local or remote user.
-
-        Args:
-            user_id: The MXID of a local user
-            other_user_id: The MXID of the other user
-
-        Returns:
-            A set of room ID's that the users share.
-        """
-
-        def _get_shared_rooms_for_users_txn(
-            txn: LoggingTransaction,
-        ) -> List[Dict[str, str]]:
-            txn.execute(
-                """
-                SELECT p1.room_id
-                FROM users_in_public_rooms as p1
-                INNER JOIN users_in_public_rooms as p2
-                    ON p1.room_id = p2.room_id
-                    AND p1.user_id = ?
-                    AND p2.user_id = ?
-                UNION
-                SELECT room_id
-                FROM users_who_share_private_rooms
-                WHERE
-                    user_id = ?
-                    AND other_user_id = ?
-                """,
-                (user_id, other_user_id, user_id, other_user_id),
-            )
-            rows = self.db_pool.cursor_to_dict(txn)
-            return rows
-
-        rows = await self.db_pool.runInteraction(
-            "get_shared_rooms_for_users", _get_shared_rooms_for_users_txn
-        )
-
-        return {row["room_id"] for row in rows}
-
     async def get_user_directory_stream_pos(self) -> Optional[int]:
         """
         Get the stream ID of the user directory stream.
@@ -777,7 +752,7 @@ class UserDirectoryStore(UserDirectoryBackgroundUpdateStore):
 
     async def search_user_dir(
         self, user_id: str, search_term: str, limit: int
-    ) -> JsonDict:
+    ) -> SearchResult:
         """Searches for users in directory
 
         Returns:
@@ -910,13 +885,16 @@ class UserDirectoryStore(UserDirectoryBackgroundUpdateStore):
             # This should be unreachable.
             raise Exception("Unrecognized database engine")
 
-        results = await self.db_pool.execute(
-            "search_user_dir", self.db_pool.cursor_to_dict, sql, *args
+        results = cast(
+            List[UserProfile],
+            await self.db_pool.execute(
+                "search_user_dir", self.db_pool.cursor_to_dict, sql, *args
+            ),
         )
 
         limited = len(results) > limit
 
-        return {"limited": limited, "results": results}
+        return {"limited": limited, "results": results[0:limit]}
 
 
 def _parse_query_sqlite(search_term: str) -> str:
@@ -930,7 +908,7 @@ def _parse_query_sqlite(search_term: str) -> str:
     """
 
     # Pull out the individual words, discarding any non-word characters.
-    results = re.findall(r"([\w\-]+)", search_term, re.UNICODE)
+    results = _parse_words(search_term)
     return " & ".join("(%s* OR %s)" % (result, result) for result in results)
 
 
@@ -940,12 +918,63 @@ def _parse_query_postgres(search_term: str) -> Tuple[str, str, str]:
     We use this so that we can add prefix matching, which isn't something
     that is supported by default.
     """
-
-    # Pull out the individual words, discarding any non-word characters.
-    results = re.findall(r"([\w\-]+)", search_term, re.UNICODE)
+    results = _parse_words(search_term)
 
     both = " & ".join("(%s:* | %s)" % (result, result) for result in results)
     exact = " & ".join("%s" % (result,) for result in results)
     prefix = " & ".join("%s:*" % (result,) for result in results)
 
     return both, exact, prefix
+
+
+def _parse_words(search_term: str) -> List[str]:
+    """Split the provided search string into a list of its words.
+
+    If support for ICU (International Components for Unicode) is available, use it.
+    Otherwise, fall back to using a regex to detect word boundaries. This latter
+    solution works well enough for most latin-based languages, but doesn't work as well
+    with other languages.
+
+    Args:
+        search_term: The search string.
+
+    Returns:
+        A list of the words in the search string.
+    """
+    if USE_ICU:
+        return _parse_words_with_icu(search_term)
+
+    return re.findall(r"([\w\-]+)", search_term, re.UNICODE)
+
+
+def _parse_words_with_icu(search_term: str) -> List[str]:
+    """Break down the provided search string into its individual words using ICU
+    (International Components for Unicode).
+
+    Args:
+        search_term: The search string.
+
+    Returns:
+        A list of the words in the search string.
+    """
+    results = []
+    breaker = icu.BreakIterator.createWordInstance(icu.Locale.getDefault())
+    breaker.setText(search_term)
+    i = 0
+    while True:
+        j = breaker.nextBoundary()
+        if j < 0:
+            break
+
+        result = search_term[i:j]
+
+        # libicu considers spaces and punctuation between words as words, but we don't
+        # want to include those in results as they would result in syntax errors in SQL
+        # queries (e.g. "foo bar" would result in the search query including "foo &  &
+        # bar").
+        if len(re.findall(r"([\w\-]+)", result, re.UNICODE)):
+            results.append(result)
+
+        i = j
+
+    return results
