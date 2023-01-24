@@ -18,46 +18,27 @@ jobs:
       - run: scripts-dev/generate_sample_config.sh --check
 
   lint:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        toxenv:
-          - "check_codestyle"
-          - "check_isort"
-          - "mypy"
-          - "packaging"
-
-    steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
-      - run: pip install tox
-      - run: tox -e ${{ matrix.toxenv }}
+    uses: "matrix-org/backend-meta/.github/workflows/python-poetry-ci.yml@v2"
+    with:
+      typechecking-extras: "all"
 
   lint-crlf:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - name: Check line endings
         run: scripts-dev/check_line_terminators.sh
 
-  lint-sdist:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
-        with:
-          python-version: "3.x"
-      - run: pip install wheel
-      - run: python setup.py sdist bdist_wheel
-      - uses: actions/upload-artifact@v2
-        with:
-          name: Python Distributions
-          path: dist/*
+  # Dummy step to gate other tests on without repeating the whole list
 
   # Dummy step to gate other tests on without repeating the whole list
   linting-done:
-    if: ${{ always() }} # Run this even if prior jobs were skipped
-    needs: [lint, lint-crlf, lint-sdist]
+    if: ${{ !cancelled() }} # Run this even if prior jobs were skipped
+    needs:
+    # Note(joseb): we ignore several upstream lint jobs such as pydantic, clippy, rustfmt, etc.
+    # because our forked version doesn't include changes on rust or configuration data.
+      - lint
+      - lint-crlf
     runs-on: ubuntu-latest
     steps:
       - run: "true"
@@ -70,7 +51,7 @@ jobs:
     steps:
 
     - name: Check out code
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
 
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v1
