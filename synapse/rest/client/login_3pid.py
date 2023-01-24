@@ -73,7 +73,7 @@ class EmailLogin3pidRequestTokenRestServlet(RestServlet):
             )
 
     async def on_POST(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
-        self._address_ratelimiter.ratelimit(None, request.getClientIP())
+        await self._address_ratelimiter.ratelimit(None, request.getClientAddress().host)
         if not self.config.email.can_verify_email:
             logger.warning(
                 "User password resets have been disabled due to lack of email config"
@@ -166,7 +166,7 @@ class EmailLogin3pidSubmitTokenRestServlet(RestServlet):
         )
 
     async def on_POST(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
-        self._address_ratelimiter.ratelimit(None, request.getClientIP())
+        await self._address_ratelimiter.ratelimit(None, request.getClientAddress().host)
         if not self.config.email.can_verify_email:
             logger.warning(
                 "User password resets have been disabled due to lack of email config"
@@ -228,7 +228,7 @@ class MsisdnLogin3pidRequestTokenRestServlet(RestServlet):
         )
 
     async def on_POST(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
-        self._address_ratelimiter.ratelimit(None, request.getClientIP())
+        await self._address_ratelimiter.ratelimit(None, request.getClientAddress().host)
 
         body = parse_json_object_from_request(request)
 
@@ -347,8 +347,8 @@ class Login3pidRestServlet(RestServlet):
         )
 
         if "type" not in login_submission:
-            self._address_ratelimiter.ratelimit(
-                None, request.getClientIP(), update=False
+            await self._address_ratelimiter.ratelimit(
+                None, request.getClientAddress().host, update=False
             )
 
             session_id = self.auth_handler.get_session_id(login_submission)
@@ -374,8 +374,8 @@ class Login3pidRestServlet(RestServlet):
                 login_submission["type"] == LoginType.MSISDN
                 or login_submission["type"] == LoginType.EMAIL_IDENTITY
             ):
-                self._address_ratelimiter.ratelimit(
-                    None, request.getClientIP(), update=False
+                await self._address_ratelimiter.ratelimit(
+                    None, request.getClientAddress().host, update=False
                 )
                 session_id = self.auth_handler.get_session_id(login_submission)
                 logged_user_id = None
