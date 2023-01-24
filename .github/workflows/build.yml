@@ -18,7 +18,7 @@ jobs:
       - run: scripts-dev/generate_sample_config.sh --check
 
   lint:
-    uses: "matrix-org/backend-meta/.github/workflows/python-poetry-ci.yml@v2"
+    uses: "matrix-org/backend-meta/.github/workflows/python-poetry-ci.yml@v1"
     with:
       typechecking-extras: "all"
 
